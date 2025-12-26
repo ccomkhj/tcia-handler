@@ -2,22 +2,21 @@
 
 Scripts for generating TCIA manifest files for the Prostate MRI pipeline.
 
-This repo is split out from `mri/` so TCIA-specific logic can evolve
-independently.
+This repo is part of [MRI_2.5D](https://github.com/ccomkhj/MRI_2.5D_Segmentation).
 
-Data download workflow and manifests are maintained in:
-https://github.com/ccomkhj/tcia-handler
+```
+git clone https://github.com/ccomkhj/MRI_2.5D_Segmentation mri
+```
 
 ## Contents
 
 ```
 tcia-handler/
 └── tools/
-    └── tcia/
-        ├── tcia_generator.py
-        ├── generate_tcia_by_class.py
-        ├── generate_tcia_by_study.py
-        └── README_TCIA_GENERATOR.md
+    ├── tcia_generator.py
+    ├── generate_tcia_by_class.py
+    ├── generate_tcia_by_study.py
+    └── README_TCIA_GENERATOR.md
 ```
 
 ## Usage
@@ -31,10 +30,10 @@ If your repos are not siblings, set one of:
 
 ```bash
 # By series (T2, ADC, CALC_BVAL)
-python ../tcia-handler/tools/tcia/generate_tcia_by_class.py
+python tcia-handler/tools/tcia/generate_tcia_by_class.py
 
 # By study (full download)
-python ../tcia-handler/tools/tcia/generate_tcia_by_study.py
+python tcia-handler/tools/tcia/generate_tcia_by_study.py
 ```
 
 ## Outputs
@@ -44,5 +43,4 @@ python ../tcia-handler/tools/tcia/generate_tcia_by_study.py
 
 ## Notes
 
-- Input files and parquet mappings are expected under `mri/data/`.
 - See `tcia-handler/tools/tcia/README_TCIA_GENERATOR.md` for details.
