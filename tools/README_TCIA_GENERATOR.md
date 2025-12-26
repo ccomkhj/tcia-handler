@@ -97,7 +97,7 @@ After generating the TCIA files:
    - `data/nbia/ep2d_adc/class{1,2,3,4}/`
    - `data/nbia/ep2d_calc/class{1,2,3,4}/`
 
-3. Convert DICOM to images using `dicom_converter.py`
+3. Convert DICOM to images using `tcia-handler/tools/preprocessing/dicom_converter.py`
 
 ## Troubleshooting
 
@@ -113,4 +113,3 @@ After generating the TCIA files:
 ### Missing columns
 - The script tries multiple column name variations
 - Check the column list in the diagnostic output
-
