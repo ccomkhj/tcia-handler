@@ -51,9 +51,30 @@ def normalize_patient_id(patient_id):
     return int(patient_id)
 
 
-def load_image_data(base_dir="data/splitted_images"):
+def load_ignore_list(file_path="data/ignore_list.parquet"):
     """
-    Load all parquet files from splitted_images directory.
+    Load list of patients to ignore from parquet file.
+    
+    Args:
+        file_path (str): Path to ignore list parquet file
+    
+    Returns:
+        set: Set of patient numbers to ignore (ints)
+    """
+    if not os.path.exists(file_path):
+        print(f"No ignore list found at {file_path}")
+        return set()
+        
+    print(f"\nLoading ignore list from {file_path}")
+    df = pd.read_parquet(file_path)
+    ignored_patients = set(df["patient_number"].unique())
+    print(f"Found {len(ignored_patients)} patients to ignore")
+    return ignored_patients
+
+
+def load_image_data(base_dir="data/splitted"):
+    """
+    Load all parquet files from splitted directory.
     
     Args:
         base_dir (str): Base directory containing class partitions
@@ -84,6 +105,14 @@ def load_image_data(base_dir="data/splitted_images"):
     
     # Normalize patient_number to int for consistent joining
     combined_df["patient_number"] = combined_df["patient_number"].apply(normalize_patient_id)
+    
+    # Filter ignored patients
+    ignored_patients = load_ignore_list()
+    if ignored_patients:
+        initial_count = len(combined_df)
+        combined_df = combined_df[~combined_df["patient_number"].isin(ignored_patients)]
+        filtered_count = len(combined_df)
+        print(f"\nFiltered out {initial_count - filtered_count} rows based on ignore list")
     
     print(f"\nTotal image records: {len(combined_df)}")
     print(f"Unique patients: {combined_df['patient_number'].nunique()}")
