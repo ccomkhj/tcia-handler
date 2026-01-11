@@ -1,32 +1,47 @@
-# TCIA Handler
+# TCIA Handler & DICOM Mapper
 
-Scripts for generating TCIA manifest files and multi-modal MRI alignment for the Prostate MRI pipeline.
+Tools for TCIA manifest generation, data preprocessing, and **Standardized Multi-Modal MRI Mapping** (T2, ADC, Calc, Seg).
 
 This repo is part of [MRI_2.5D](https://github.com/ccomkhj/MRI_2.5D_Segmentation).
 
-```
-git clone https://github.com/ccomkhj/MRI_2.5D_Segmentation mri
-```
+## 🚀 New: `dicom_mapper` Package
+This project has been refactored to use `uv` and `highdicom` for robust, standard-compliant DICOM processing.
 
-## Contents
+### Setup
+```bash
+# Install uv (if not installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-```
-tcia-handler/
-├── service/
-│   ├── preprocess.py      # Full preprocessing pipeline
-│   └── mapping.py         # Multi-modal alignment (T2 + ADC + Calc)
-├── tools/
-│   ├── preprocessing/
-│   ├── validation/
-│   ├── generate_tcia_by_class.py
-│   └── generate_tcia_by_study.py
-└── docs/
-    └── dicom_mapping.md   # Multi-modal mapping guide
+# Sync dependencies
+uv sync
 ```
 
-## Usage
+### 🛠️ Usage: Mapping & Alignment
+Use the new CLI to align sequences, generate Standard DICOMs (Secondary Capture/Segmentation), and export training-ready PNGs.
 
-Run from the repo root. Set `MRI_ROOT` if repos are not siblings.
+```bash
+# Process all cases (Align -> DICOM -> PNG)
+uv run dicom-mapper process --input-dir data --output-dir data/aligned_v2
+
+# Process specific class
+uv run dicom-mapper process --input-dir data --output-dir data/aligned_v2 --class-num 2
+
+# Process single case
+uv run dicom-mapper process --input-dir data --output-dir data/aligned_v2 --case-id 0001
+```
+
+### 👁️ Usage: Visualization
+Verify alignment by overlaying segmentation masks on T2, ADC, and Calc images.
+
+```bash
+# Visualize aligned output
+uv run dicom-mapper visualize --aligned-dir data/aligned_v2 --output-dir data/visualizations_v2
+```
+
+---
+
+## Legacy Scripts (Data Prep)
+The following scripts handle initial data download and preparation.
 
 ```bash
 # Full preprocessing pipeline (Steps 1-6)
@@ -38,27 +53,28 @@ python service/preprocess.py --step merge_datasets
 python service/preprocess.py --step generate_tcia
 python service/preprocess.py --step dicom_to_png
 python service/preprocess.py --step process_overlays
-python service/preprocess.py --step validate_2d5
-
-# Multi-modal alignment (T2 + ADC + Calc → aligned output)
-python service/mapping.py --all              # Align all cases
-python service/mapping.py --class 2          # Specific class
-python service/mapping.py --dry-run          # Preview only
-python service/mapping.py --validate         # Validate output
-
-# Visualize masks with spatial alignment
-python tools/preprocessing/visualize_overlay_masks.py
 ```
 
-## Outputs
+**Note:** `service/mapping.py` is **deprecated**. Please use `uv run dicom-mapper` instead.
 
-- `data/splitted_images/`, `data/splitted_info/`
-- `data/tcia/{t2,ep2d_adc,ep2d_calc,study}/class{1-4}.tcia`
-- `data/processed/`, `data/processed_ep2d_*/`, `data/processed_seg/`
-- `data/aligned/` — Multi-channel aligned output (T2 + ADC + Calc + masks)
-- `data/visualizations/`
+## Project Structure
 
-## Notes
+```
+tcia-handler/
+├── dicom_mapper/          # NEW: Main Python package
+│   ├── cli/               # Command-line interface
+│   ├── core/              # Geometry & Highdicom logic
+│   ├── processing/        # Resampling logic
+│   └── io/                # DICOM I/O & PNG Export
+├── service/
+│   ├── preprocess.py      # Legacy orchestration script
+│   └── mapping.py         # (Deprecated) Old mapping script
+├── tools/                 # Helper scripts for data prep
+└── data/                  # Data directory
+```
 
-- See `docs/dicom_mapping.md` for multi-modal alignment details.
-- See `tools/README_TCIA_GENERATOR.md` for TCIA manifest details.
+## Outputs (New)
+- `data/aligned_v2/`
+    - `classX/case_Y/`
+        - `t2_aligned.dcm` (Standard Multi-frame DICOM)
+        - `t2/` (Exported PNGs for training)
