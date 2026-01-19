@@ -288,9 +288,15 @@ def extract_dicom_spatial_info(dicom_dir: Path) -> Optional[Dict]:
         # Column 1: J axis (col direction)
         # Column 2: K axis (slice direction)
         direction = [
-            row_dir[0], col_dir[0], slice_dir[0],  # Row 0
-            row_dir[1], col_dir[1], slice_dir[1],  # Row 1
-            row_dir[2], col_dir[2], slice_dir[2],  # Row 2
+            row_dir[0],
+            col_dir[0],
+            slice_dir[0],  # Row 0
+            row_dir[1],
+            col_dir[1],
+            slice_dir[1],  # Row 1
+            row_dir[2],
+            col_dir[2],
+            slice_dir[2],  # Row 2
         ]
 
         # Get slice thickness
@@ -362,8 +368,10 @@ def resample_mask_spatially(
         # For 2D, we need the top-left 2x2 submatrix
         src_dir = source_spatial.get("direction", [1, 0, 0, 0, 1, 0, 0, 0, 1])
         source_direction_2d = [
-            src_dir[0], src_dir[1],  # First row: d00, d01
-            src_dir[3], src_dir[4],  # Second row: d10, d11
+            src_dir[0],
+            src_dir[1],  # First row: d00, d01
+            src_dir[3],
+            src_dir[4],  # Second row: d10, d11
         ]
 
         mask_sitk.SetSpacing(source_spacing_2d)
@@ -380,8 +388,10 @@ def resample_mask_spatially(
 
         tgt_dir = target_spatial.get("direction", [1, 0, 0, 0, 1, 0, 0, 0, 1])
         target_direction_2d = [
-            tgt_dir[0], tgt_dir[1],
-            tgt_dir[3], tgt_dir[4],
+            tgt_dir[0],
+            tgt_dir[1],
+            tgt_dir[3],
+            tgt_dir[4],
         ]
 
         reference.SetSpacing(target_spacing_2d)
@@ -931,6 +941,525 @@ def visualize_case(
     return stats
 
 
+# =============================================================================
+# Multi-Modal Visualization (T2 + ADC + Masks side-by-side)
+# =============================================================================
+
+
+def visualize_multimodal_case(
+    case_id: str,
+    class_num: int,
+    output_dir: Path,
+    max_slices: Optional[int] = None,
+) -> Dict:
+    """
+    Create multi-modal visualizations showing T2, ADC, Calc, and masks side-by-side.
+
+    Layout per slice:
+    Row 1: T2 Original | T2 + Mask Overlay
+    Row 2: ADC Original | ADC + Mask Overlay
+    Row 3: Calc Original | Calc + Mask Overlay
+
+    All modalities are shown even if masks are not available for that slice.
+    ADC/Calc are spatially aligned to T2's coordinate system.
+
+    Args:
+        case_id: Case ID (e.g., "0144")
+        class_num: Class number (1-4)
+        output_dir: Output directory for visualizations
+        max_slices: Maximum slices to visualize (None = all slices)
+
+    Returns:
+        Statistics dict
+    """
+    stats = {
+        "visualizations_created": 0,
+        "t2_slices": 0,
+        "adc_slices": 0,
+        "calc_slices": 0,
+        "mask_slices": 0,
+    }
+
+    case_name = f"case_{case_id}"
+    class_name = f"class{class_num}"
+
+    # Paths
+    t2_processed = SEQUENCE_PROCESSED_DIRS["t2"] / class_name / case_name
+    adc_processed = SEQUENCE_PROCESSED_DIRS["ep2d_adc"] / class_name / case_name
+    calc_processed = SEQUENCE_PROCESSED_DIRS["ep2d_calc"] / class_name / case_name
+    seg_processed = Path("data/processed_seg") / class_name / case_name
+
+    t2_dicom_base = DICOM_DIRS["t2"]
+    adc_dicom_base = DICOM_DIRS["ep2d_adc"]
+    calc_dicom_base = DICOM_DIRS["ep2d_calc"]
+
+    # Check T2 exists (required as reference)
+    if not t2_processed.exists():
+        print(f"⚠️  T2 not found for {class_name}/{case_name}")
+        return stats
+
+    # Find T2 series directory
+    t2_series_dirs = [d for d in t2_processed.iterdir() if d.is_dir()]
+    if not t2_series_dirs:
+        print(f"⚠️  No T2 series found for {class_name}/{case_name}")
+        return stats
+
+    t2_series_dir = t2_series_dirs[0]
+    t2_series_uid = t2_series_dir.name
+    t2_images_dir = t2_series_dir / "images"
+    t2_meta = read_meta(t2_series_dir)
+
+    if not t2_images_dir.exists():
+        return stats
+
+    t2_image_files = sorted(t2_images_dir.glob("*.png"))
+    if not t2_image_files:
+        return stats
+
+    stats["t2_slices"] = len(t2_image_files)
+
+    # Get T2 DICOM spatial info
+    t2_dicom_dir = find_dicom_series_dir(
+        t2_dicom_base, class_num, case_id, t2_series_uid
+    )
+    t2_spatial = extract_dicom_spatial_info(t2_dicom_dir) if t2_dicom_dir else None
+    t2_z_positions = (
+        extract_slice_locations_from_dicom(t2_dicom_dir) if t2_dicom_dir else []
+    )
+
+    # Load ADC if available
+    adc_images = {}
+    adc_spatial = None
+    adc_to_t2_mapping = {}
+
+    if adc_processed.exists():
+        adc_series_dirs = [d for d in adc_processed.iterdir() if d.is_dir()]
+        if adc_series_dirs:
+            adc_series_dir = adc_series_dirs[0]
+            adc_series_uid = adc_series_dir.name
+            adc_images_dir = adc_series_dir / "images"
+
+            if adc_images_dir.exists():
+                adc_image_files = sorted(adc_images_dir.glob("*.png"))
+                stats["adc_slices"] = len(adc_image_files)
+
+                # Get ADC DICOM spatial info
+                adc_dicom_dir = find_dicom_series_dir(
+                    adc_dicom_base, class_num, case_id, adc_series_uid
+                )
+                adc_spatial = (
+                    extract_dicom_spatial_info(adc_dicom_dir) if adc_dicom_dir else None
+                )
+                adc_z_positions = (
+                    extract_slice_locations_from_dicom(adc_dicom_dir)
+                    if adc_dicom_dir
+                    else []
+                )
+
+                # Build ADC index by slice number
+                for f in adc_image_files:
+                    adc_images[int(f.stem)] = f
+
+                # Compute T2-to-ADC spatial mapping
+                if t2_z_positions and adc_z_positions:
+                    # For each T2 slice, find nearest ADC slice
+                    adc_z_arr = np.array(adc_z_positions)
+                    for t2_idx, t2_z in enumerate(t2_z_positions):
+                        distances = np.abs(adc_z_arr - t2_z)
+                        nearest_adc_idx = int(np.argmin(distances))
+                        min_dist = distances[nearest_adc_idx]
+                        # Only map if within reasonable distance (e.g., half ADC slice thickness)
+                        adc_thickness = (
+                            adc_spatial["spacing"][2] if adc_spatial else 3.6
+                        )
+                        if min_dist < adc_thickness:
+                            adc_to_t2_mapping[t2_idx] = nearest_adc_idx
+
+    # Load Calc if available
+    calc_images = {}
+    calc_spatial = None
+    calc_to_t2_mapping = {}
+
+    if calc_processed.exists():
+        calc_series_dirs = [d for d in calc_processed.iterdir() if d.is_dir()]
+        if calc_series_dirs:
+            calc_series_dir = calc_series_dirs[0]
+            calc_series_uid = calc_series_dir.name
+            calc_images_dir = calc_series_dir / "images"
+
+            if calc_images_dir.exists():
+                calc_image_files = sorted(calc_images_dir.glob("*.png"))
+                stats["calc_slices"] = len(calc_image_files)
+
+                # Get Calc DICOM spatial info
+                calc_dicom_dir = find_dicom_series_dir(
+                    calc_dicom_base, class_num, case_id, calc_series_uid
+                )
+                calc_spatial = (
+                    extract_dicom_spatial_info(calc_dicom_dir)
+                    if calc_dicom_dir
+                    else None
+                )
+                calc_z_positions = (
+                    extract_slice_locations_from_dicom(calc_dicom_dir)
+                    if calc_dicom_dir
+                    else []
+                )
+
+                # Build Calc index
+                for f in calc_image_files:
+                    calc_images[int(f.stem)] = f
+
+                # Compute T2-to-Calc spatial mapping
+                if t2_z_positions and calc_z_positions:
+                    calc_z_arr = np.array(calc_z_positions)
+                    for t2_idx, t2_z in enumerate(t2_z_positions):
+                        distances = np.abs(calc_z_arr - t2_z)
+                        nearest_calc_idx = int(np.argmin(distances))
+                        min_dist = distances[nearest_calc_idx]
+                        calc_thickness = (
+                            calc_spatial["spacing"][2] if calc_spatial else 3.6
+                        )
+                        if min_dist < calc_thickness:
+                            calc_to_t2_mapping[t2_idx] = nearest_calc_idx
+
+    # Load masks
+    mask_data = {}  # {structure_name: {slice_idx: mask_array}}
+
+    if seg_processed.exists():
+        seg_series_info = build_seg_series_index(seg_processed)
+        # Find seg series matching T2
+        seg_entry = None
+        if t2_series_uid in seg_series_info:
+            seg_entry = seg_series_info[t2_series_uid]
+        elif seg_series_info:
+            # Use first available
+            seg_entry = list(seg_series_info.values())[0]
+
+        if seg_entry:
+            for struct_dir in seg_entry["structure_dirs"]:
+                struct_name = struct_dir.name
+                mask_data[struct_name] = {}
+                mask_files = sorted(struct_dir.glob("*.png"))
+                for mf in mask_files:
+                    slice_idx = int(mf.stem)
+                    mask_data[struct_name][slice_idx] = mf
+                if mask_files:
+                    stats["mask_slices"] = max(stats["mask_slices"], len(mask_files))
+
+    # Create output directory
+    case_output_dir = output_dir / class_name / case_name
+    case_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sample slices evenly (or use all if max_slices is None)
+    if max_slices is not None and len(t2_image_files) > max_slices:
+        indices = np.linspace(0, len(t2_image_files) - 1, max_slices, dtype=int)
+        selected_t2_files = [t2_image_files[i] for i in indices]
+    else:
+        selected_t2_files = t2_image_files  # Use all slices
+
+    # Process each T2 slice
+    for t2_file in selected_t2_files:
+        t2_slice_idx = int(t2_file.stem)
+
+        # Load T2 image
+        t2_img = load_image(t2_file)
+        if t2_img is None:
+            continue
+
+        # Get corresponding ADC image
+        adc_img = None
+        if t2_slice_idx in adc_to_t2_mapping:
+            adc_idx = adc_to_t2_mapping[t2_slice_idx]
+            if adc_idx in adc_images:
+                adc_img = load_image(adc_images[adc_idx])
+                # Resize ADC to T2 dimensions for display
+                if adc_img is not None and adc_img.shape != t2_img.shape:
+                    adc_img = np.array(
+                        Image.fromarray(adc_img).resize(
+                            (t2_img.shape[1], t2_img.shape[0]), Image.BILINEAR
+                        )
+                    )
+
+        # Get corresponding Calc image
+        calc_img = None
+        if t2_slice_idx in calc_to_t2_mapping:
+            calc_idx = calc_to_t2_mapping[t2_slice_idx]
+            if calc_idx in calc_images:
+                calc_img = load_image(calc_images[calc_idx])
+                # Resize Calc to T2 dimensions for display
+                if calc_img is not None and calc_img.shape != t2_img.shape:
+                    calc_img = np.array(
+                        Image.fromarray(calc_img).resize(
+                            (t2_img.shape[1], t2_img.shape[0]), Image.BILINEAR
+                        )
+                    )
+
+        # Load masks for this slice
+        masks_for_slice = {}
+        for struct_name, slice_masks in mask_data.items():
+            if t2_slice_idx in slice_masks:
+                mask = load_image(slice_masks[t2_slice_idx])
+                if mask is not None:
+                    # Resize mask to T2 dimensions if needed
+                    if mask.shape != t2_img.shape:
+                        mask = np.array(
+                            Image.fromarray(mask).resize(
+                                (t2_img.shape[1], t2_img.shape[0]), Image.NEAREST
+                            )
+                        )
+                    masks_for_slice[struct_name] = mask
+
+        # Create figure with 3 rows (T2, ADC, Calc) x 2 cols (Original, Overlay)
+        num_rows = (
+            1
+            + (1 if adc_img is not None or adc_images else 0)
+            + (1 if calc_img is not None or calc_images else 0)
+        )
+        if num_rows == 1 and not adc_images and not calc_images:
+            num_rows = 1  # Only T2
+        else:
+            num_rows = 3  # Always show 3 rows for consistency
+
+        fig, axes = plt.subplots(num_rows, 2, figsize=(10, 5 * num_rows))
+        if num_rows == 1:
+            axes = axes.reshape(1, 2)
+
+        row = 0
+
+        # Row 1: T2
+        axes[row, 0].imshow(t2_img, cmap="gray")
+        axes[row, 0].set_title(f"T2 (slice {t2_slice_idx})")
+        axes[row, 0].axis("off")
+
+        # T2 with overlay
+        t2_overlay = t2_img.copy()
+        if len(t2_overlay.shape) == 2:
+            t2_overlay = np.stack([t2_overlay] * 3, axis=-1)
+        if t2_overlay.dtype != np.uint8:
+            t2_overlay = (t2_overlay / t2_overlay.max() * 255).astype(np.uint8)
+
+        for struct_name, mask in masks_for_slice.items():
+            color = STRUCTURE_COLORS.get(struct_name, STRUCTURE_COLORS["default"])
+            t2_overlay = create_overlay(t2_overlay, mask, color)
+
+        axes[row, 1].imshow(t2_overlay)
+        mask_names = ", ".join(masks_for_slice.keys()) if masks_for_slice else "No mask"
+        axes[row, 1].set_title(f"T2 + Mask ({mask_names})")
+        axes[row, 1].axis("off")
+        row += 1
+
+        # Row 2: ADC
+        if num_rows >= 2:
+            if adc_img is not None:
+                axes[row, 0].imshow(adc_img, cmap="gray")
+                adc_slice_info = (
+                    f"→T2:{t2_slice_idx}" if t2_slice_idx in adc_to_t2_mapping else ""
+                )
+                axes[row, 0].set_title(
+                    f"ADC (slice {adc_to_t2_mapping.get(t2_slice_idx, '?')}) {adc_slice_info}"
+                )
+                axes[row, 0].axis("off")
+
+                # ADC with overlay (using same mask, spatially aligned)
+                adc_overlay = adc_img.copy()
+                if len(adc_overlay.shape) == 2:
+                    adc_overlay = np.stack([adc_overlay] * 3, axis=-1)
+                if adc_overlay.dtype != np.uint8:
+                    adc_overlay = (
+                        adc_overlay / max(adc_overlay.max(), 1) * 255
+                    ).astype(np.uint8)
+
+                for struct_name, mask in masks_for_slice.items():
+                    color = STRUCTURE_COLORS.get(
+                        struct_name, STRUCTURE_COLORS["default"]
+                    )
+                    adc_overlay = create_overlay(adc_overlay, mask, color)
+
+                axes[row, 1].imshow(adc_overlay)
+                axes[row, 1].set_title(f"ADC + Mask")
+                axes[row, 1].axis("off")
+            else:
+                # No ADC available
+                axes[row, 0].text(
+                    0.5,
+                    0.5,
+                    "ADC\nNot Available",
+                    ha="center",
+                    va="center",
+                    fontsize=14,
+                    transform=axes[row, 0].transAxes,
+                )
+                axes[row, 0].set_facecolor("#f0f0f0")
+                axes[row, 0].axis("off")
+                axes[row, 1].text(
+                    0.5,
+                    0.5,
+                    "ADC + Mask\nNot Available",
+                    ha="center",
+                    va="center",
+                    fontsize=14,
+                    transform=axes[row, 1].transAxes,
+                )
+                axes[row, 1].set_facecolor("#f0f0f0")
+                axes[row, 1].axis("off")
+            row += 1
+
+        # Row 3: Calc
+        if num_rows >= 3:
+            if calc_img is not None:
+                axes[row, 0].imshow(calc_img, cmap="gray")
+                calc_slice_info = (
+                    f"→T2:{t2_slice_idx}" if t2_slice_idx in calc_to_t2_mapping else ""
+                )
+                axes[row, 0].set_title(
+                    f"Calc (slice {calc_to_t2_mapping.get(t2_slice_idx, '?')}) {calc_slice_info}"
+                )
+                axes[row, 0].axis("off")
+
+                # Calc with overlay
+                calc_overlay = calc_img.copy()
+                if len(calc_overlay.shape) == 2:
+                    calc_overlay = np.stack([calc_overlay] * 3, axis=-1)
+                if calc_overlay.dtype != np.uint8:
+                    calc_overlay = (
+                        calc_overlay / max(calc_overlay.max(), 1) * 255
+                    ).astype(np.uint8)
+
+                for struct_name, mask in masks_for_slice.items():
+                    color = STRUCTURE_COLORS.get(
+                        struct_name, STRUCTURE_COLORS["default"]
+                    )
+                    calc_overlay = create_overlay(calc_overlay, mask, color)
+
+                axes[row, 1].imshow(calc_overlay)
+                axes[row, 1].set_title(f"Calc + Mask")
+                axes[row, 1].axis("off")
+            else:
+                # No Calc available
+                axes[row, 0].text(
+                    0.5,
+                    0.5,
+                    "Calc\nNot Available",
+                    ha="center",
+                    va="center",
+                    fontsize=14,
+                    transform=axes[row, 0].transAxes,
+                )
+                axes[row, 0].set_facecolor("#f0f0f0")
+                axes[row, 0].axis("off")
+                axes[row, 1].text(
+                    0.5,
+                    0.5,
+                    "Calc + Mask\nNot Available",
+                    ha="center",
+                    va="center",
+                    fontsize=14,
+                    transform=axes[row, 1].transAxes,
+                )
+                axes[row, 1].set_facecolor("#f0f0f0")
+                axes[row, 1].axis("off")
+
+        # Add legend for masks
+        if masks_for_slice:
+            legend_elements = []
+            for struct_name in masks_for_slice.keys():
+                color = STRUCTURE_COLORS.get(struct_name, STRUCTURE_COLORS["default"])
+                legend_elements.append(
+                    patches.Patch(
+                        facecolor=np.array(color[:3]) / 255.0,
+                        label=struct_name.capitalize(),
+                    )
+                )
+            fig.legend(
+                handles=legend_elements, loc="lower center", ncol=len(legend_elements)
+            )
+
+        plt.suptitle(f"{class_name}/{case_name} - T2 Slice {t2_slice_idx}", fontsize=14)
+        plt.tight_layout()
+
+        # Save
+        output_file = case_output_dir / f"multimodal_slice_{t2_slice_idx:04d}.png"
+        plt.savefig(output_file, dpi=150, bbox_inches="tight")
+        plt.close()
+
+        stats["visualizations_created"] += 1
+
+    return stats
+
+
+def main_multimodal(max_slices: Optional[int] = None):
+    """Main function for multi-modal visualization.
+
+    Args:
+        max_slices: Maximum slices per case (None = all slices)
+    """
+
+    print("=" * 80)
+    print("Multi-Modal Segmentation Visualization (T2 + ADC + Calc + Masks)")
+    print("=" * 80)
+
+    output_dir = Path("data/visualizations_multimodal")
+    # max_slices=None means visualize ALL slices
+
+    # Find all cases from T2 processed directory
+    t2_processed = SEQUENCE_PROCESSED_DIRS["t2"]
+    seg_processed = Path("data/processed_seg")
+
+    if not t2_processed.exists():
+        print(f"❌ T2 processed directory not found: {t2_processed}")
+        return
+
+    # Collect all cases
+    cases = []
+    for class_dir in sorted(t2_processed.glob("class*")):
+        class_num = int(class_dir.name.replace("class", ""))
+        for case_dir in sorted(class_dir.glob("case_*")):
+            case_id = case_dir.name.replace("case_", "")
+            # Check if segmentation exists
+            seg_case = seg_processed / class_dir.name / case_dir.name
+            if seg_case.exists():
+                cases.append((case_id, class_num))
+
+    print(f"Found {len(cases)} cases with T2 and segmentation data")
+
+    total_stats = {
+        "visualizations_created": 0,
+        "t2_slices": 0,
+        "adc_slices": 0,
+        "calc_slices": 0,
+        "mask_slices": 0,
+    }
+
+    pbar = tqdm(cases, desc="Processing cases")
+    for case_id, class_num in pbar:
+        pbar.set_description(f"class{class_num}/case_{case_id}")
+
+        stats = visualize_multimodal_case(
+            case_id=case_id,
+            class_num=class_num,
+            output_dir=output_dir,
+            max_slices=max_slices,
+        )
+
+        for key, value in stats.items():
+            total_stats[key] += value
+
+        pbar.set_postfix({"Viz": total_stats["visualizations_created"]})
+
+    print(f"\n{'='*80}")
+    print("Multi-Modal Visualization Complete!")
+    print(f"{'='*80}")
+    print(f"\nSummary:")
+    print(f"  Cases processed: {len(cases)}")
+    print(f"  Visualizations created: {total_stats['visualizations_created']}")
+    print(f"  Total T2 slices: {total_stats['t2_slices']}")
+    print(f"  Total ADC slices: {total_stats['adc_slices']}")
+    print(f"  Total Calc slices: {total_stats['calc_slices']}")
+    print(f"  Total Mask slices: {total_stats['mask_slices']}")
+    print(f"\nOutput: {output_dir}/")
+
+
 def main():
     """Main execution function."""
 
@@ -1072,4 +1601,40 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--multimodal":
+        # Parse optional --max-slices argument
+        max_slices = None
+        if len(sys.argv) > 2:
+            for i, arg in enumerate(sys.argv[2:], start=2):
+                if arg == "--max-slices" and i + 1 < len(sys.argv):
+                    try:
+                        max_slices = int(sys.argv[i + 1])
+                    except ValueError:
+                        pass
+                elif arg.startswith("--max-slices="):
+                    try:
+                        max_slices = int(arg.split("=")[1])
+                    except ValueError:
+                        pass
+
+        if max_slices:
+            print(f"Limiting to {max_slices} slices per case")
+        else:
+            print("Visualizing ALL slices per case")
+
+        main_multimodal(max_slices=max_slices)
+    else:
+        print("Usage:")
+        print(
+            "  python visualize_overlay_masks.py              # Original single-sequence mode"
+        )
+        print(
+            "  python visualize_overlay_masks.py --multimodal # Multi-modal (ALL slices)"
+        )
+        print(
+            "  python visualize_overlay_masks.py --multimodal --max-slices 10  # Limit slices"
+        )
+        print()
+        main()
