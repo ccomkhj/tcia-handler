@@ -17,6 +17,8 @@ Requirements:
 """
 
 import json
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -1027,15 +1029,36 @@ def visualize_multimodal_case(
         extract_slice_locations_from_dicom(t2_dicom_dir) if t2_dicom_dir else []
     )
 
+    # Helper function to select series matching T2's StudyInstanceUID
+    def select_matching_series(
+        series_dirs: List[Path], t2_study_uid: Optional[str]
+    ) -> Optional[Path]:
+        """Select series with matching StudyInstanceUID, or first available."""
+        if not series_dirs:
+            return None
+        if not t2_study_uid:
+            return series_dirs[0]
+
+        # Try to find series with matching StudyInstanceUID
+        for series_dir in series_dirs:
+            meta = read_meta(series_dir)
+            if meta.get("StudyInstanceUID") == t2_study_uid:
+                return series_dir
+
+        # Fallback to first series
+        return series_dirs[0]
+
+    t2_study_uid = t2_meta.get("StudyInstanceUID") if t2_meta else None
+
     # Load ADC if available
     adc_images = {}
     adc_spatial = None
     adc_to_t2_mapping = {}
 
     if adc_processed.exists():
-        adc_series_dirs = [d for d in adc_processed.iterdir() if d.is_dir()]
-        if adc_series_dirs:
-            adc_series_dir = adc_series_dirs[0]
+        adc_series_dirs = [d for d in sorted(adc_processed.iterdir()) if d.is_dir()]
+        adc_series_dir = select_matching_series(adc_series_dirs, t2_study_uid)
+        if adc_series_dir:
             adc_series_uid = adc_series_dir.name
             adc_images_dir = adc_series_dir / "images"
 
@@ -1068,7 +1091,7 @@ def visualize_multimodal_case(
                         distances = np.abs(adc_z_arr - t2_z)
                         nearest_adc_idx = int(np.argmin(distances))
                         min_dist = distances[nearest_adc_idx]
-                        # Only map if within reasonable distance (e.g., half ADC slice thickness)
+                        # Only map if within reasonable distance (slice thickness)
                         adc_thickness = (
                             adc_spatial["spacing"][2] if adc_spatial else 3.6
                         )
@@ -1081,9 +1104,9 @@ def visualize_multimodal_case(
     calc_to_t2_mapping = {}
 
     if calc_processed.exists():
-        calc_series_dirs = [d for d in calc_processed.iterdir() if d.is_dir()]
-        if calc_series_dirs:
-            calc_series_dir = calc_series_dirs[0]
+        calc_series_dirs = [d for d in sorted(calc_processed.iterdir()) if d.is_dir()]
+        calc_series_dir = select_matching_series(calc_series_dirs, t2_study_uid)
+        if calc_series_dir:
             calc_series_uid = calc_series_dir.name
             calc_images_dir = calc_series_dir / "images"
 
@@ -1431,21 +1454,32 @@ def main_multimodal(max_slices: Optional[int] = None):
         "mask_slices": 0,
     }
 
-    pbar = tqdm(cases, desc="Processing cases")
-    for case_id, class_num in pbar:
-        pbar.set_description(f"class{class_num}/case_{case_id}")
+    # Use parallel processing
+    num_workers = max(1, multiprocessing.cpu_count() - 1)  # Leave one core free
+    print(f"Parallelizing with {num_workers} workers...")
 
-        stats = visualize_multimodal_case(
-            case_id=case_id,
-            class_num=class_num,
-            output_dir=output_dir,
-            max_slices=max_slices,
-        )
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        for case_id, class_num in cases:
+            futures.append(
+                executor.submit(
+                    visualize_multimodal_case,
+                    case_id=case_id,
+                    class_num=class_num,
+                    output_dir=output_dir,
+                    max_slices=max_slices,
+                )
+            )
 
-        for key, value in stats.items():
-            total_stats[key] += value
-
-        pbar.set_postfix({"Viz": total_stats["visualizations_created"]})
+        for future in tqdm(
+            as_completed(futures), total=len(cases), desc="Processing cases"
+        ):
+            try:
+                stats = future.result()
+                for key, value in stats.items():
+                    total_stats[key] += value
+            except Exception as e:
+                print(f"Error processing case: {e}")
 
     print(f"\n{'='*80}")
     print("Multi-Modal Visualization Complete!")
