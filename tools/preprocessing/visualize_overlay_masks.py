@@ -65,6 +65,78 @@ DICOM_DIRS = {
 # =============================================================================
 
 
+def load_dicom_series_as_sitk(dicom_dir: Path) -> Optional[sitk.Image]:
+    """
+    Load a DICOM series directly using SimpleITK's native reader.
+    
+    This is the recommended approach as it correctly handles all spatial
+    metadata (origin, spacing, direction) without manual extraction.
+    
+    Args:
+        dicom_dir: Directory containing DICOM files for a single series.
+        
+    Returns:
+        SimpleITK Image with correct spatial metadata, or None on failure.
+    """
+    if not HAS_SPATIAL_LIBS or not dicom_dir or not dicom_dir.exists():
+        return None
+    
+    try:
+        dicom_dir_str = str(dicom_dir)
+        
+        # Get sorted file names for the series
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir_str)
+        
+        if not dicom_names:
+            return None
+        
+        reader.SetFileNames(dicom_names)
+        
+        # Load with metadata
+        reader.MetaDataDictionaryArrayUpdateOn()
+        reader.LoadPrivateTagsOn()
+        
+        volume = reader.Execute()
+        return volume
+    except Exception as e:
+        print(f"Warning: Failed to load DICOM series from {dicom_dir}: {e}")
+        return None
+
+
+def resample_volume_to_reference(
+    moving: sitk.Image, 
+    reference: sitk.Image,
+    interpolation: str = "linear"
+) -> sitk.Image:
+    """
+    Resample a moving image to the reference image's grid.
+    
+    This properly handles different origins, spacings, and directions
+    between the two volumes.
+    
+    Args:
+        moving: Volume to resample (e.g., ADC)
+        reference: Reference volume defining output geometry (e.g., T2)
+        interpolation: "linear" or "nearest"
+        
+    Returns:
+        Resampled volume in reference's coordinate system.
+    """
+    if interpolation == "nearest":
+        interpolator = sitk.sitkNearestNeighbor
+    else:
+        interpolator = sitk.sitkLinear
+    
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(reference)
+    resampler.SetInterpolator(interpolator)
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetTransform(sitk.Transform())  # Identity - spatial metadata handles mapping
+    
+    return resampler.Execute(moving)
+
+
 def extract_slice_locations_from_dicom(dicom_dir: Path) -> List[float]:
     """
     Extract per-slice z-positions from DICOM files.
@@ -1050,8 +1122,20 @@ def visualize_multimodal_case(
 
     t2_study_uid = t2_meta.get("StudyInstanceUID") if t2_meta else None
 
-    # Load ADC if available
-    adc_images = {}
+    # ==========================================================================
+    # Load DICOM volumes using SimpleITK's native reader for proper spatial handling
+    # ==========================================================================
+    
+    # Load T2 volume (reference)
+    t2_volume = load_dicom_series_as_sitk(t2_dicom_dir) if t2_dicom_dir else None
+    t2_array = None
+    if t2_volume is not None:
+        t2_array = sitk.GetArrayFromImage(t2_volume)  # Shape: (Z, Y, X)
+        print(f"  ✓ T2 volume loaded: {t2_volume.GetSize()}, spacing={t2_volume.GetSpacing()}")
+
+    # Load and resample ADC to T2's coordinate system
+    adc_resampled_array = None
+    adc_images = {}  # Fallback to PNG-based if DICOM loading fails
     adc_spatial = None
     adc_to_t2_mapping = {}
 
@@ -1066,40 +1150,53 @@ def visualize_multimodal_case(
                 adc_image_files = sorted(adc_images_dir.glob("*.png"))
                 stats["adc_slices"] = len(adc_image_files)
 
-                # Get ADC DICOM spatial info
+                # Get ADC DICOM directory
                 adc_dicom_dir = find_dicom_series_dir(
                     adc_dicom_base, class_num, case_id, adc_series_uid
                 )
-                adc_spatial = (
-                    extract_dicom_spatial_info(adc_dicom_dir) if adc_dicom_dir else None
-                )
-                adc_z_positions = (
-                    extract_slice_locations_from_dicom(adc_dicom_dir)
-                    if adc_dicom_dir
-                    else []
-                )
-
-                # Build ADC index by slice number
-                for f in adc_image_files:
-                    adc_images[int(f.stem)] = f
-
-                # Compute T2-to-ADC spatial mapping
-                if t2_z_positions and adc_z_positions:
-                    # For each T2 slice, find nearest ADC slice
-                    adc_z_arr = np.array(adc_z_positions)
-                    for t2_idx, t2_z in enumerate(t2_z_positions):
-                        distances = np.abs(adc_z_arr - t2_z)
-                        nearest_adc_idx = int(np.argmin(distances))
-                        min_dist = distances[nearest_adc_idx]
-                        # Only map if within reasonable distance (slice thickness)
-                        adc_thickness = (
-                            adc_spatial["spacing"][2] if adc_spatial else 3.6
+                
+                # Try to load and resample ADC using native DICOM reader
+                if t2_volume is not None and adc_dicom_dir:
+                    adc_volume = load_dicom_series_as_sitk(adc_dicom_dir)
+                    if adc_volume is not None:
+                        # Resample ADC to T2's coordinate system
+                        adc_resampled = resample_volume_to_reference(
+                            adc_volume, t2_volume, interpolation="linear"
                         )
-                        if min_dist < adc_thickness:
-                            adc_to_t2_mapping[t2_idx] = nearest_adc_idx
+                        adc_resampled_array = sitk.GetArrayFromImage(adc_resampled)
+                        print(f"  ✓ ADC resampled to T2 grid: {adc_resampled.GetSize()}")
+                
+                # Fallback: build PNG index and z-mapping if DICOM approach failed
+                if adc_resampled_array is None:
+                    adc_spatial = (
+                        extract_dicom_spatial_info(adc_dicom_dir) if adc_dicom_dir else None
+                    )
+                    adc_z_positions = (
+                        extract_slice_locations_from_dicom(adc_dicom_dir)
+                        if adc_dicom_dir
+                        else []
+                    )
 
-    # Load Calc if available
-    calc_images = {}
+                    # Build ADC index by slice number
+                    for f in adc_image_files:
+                        adc_images[int(f.stem)] = f
+
+                    # Compute T2-to-ADC spatial mapping
+                    if t2_z_positions and adc_z_positions:
+                        adc_z_arr = np.array(adc_z_positions)
+                        for t2_idx, t2_z in enumerate(t2_z_positions):
+                            distances = np.abs(adc_z_arr - t2_z)
+                            nearest_adc_idx = int(np.argmin(distances))
+                            min_dist = distances[nearest_adc_idx]
+                            adc_thickness = (
+                                adc_spatial["spacing"][2] if adc_spatial else 3.6
+                            )
+                            if min_dist < adc_thickness:
+                                adc_to_t2_mapping[t2_idx] = nearest_adc_idx
+
+    # Load and resample Calc to T2's coordinate system
+    calc_resampled_array = None
+    calc_images = {}  # Fallback to PNG-based if DICOM loading fails
     calc_spatial = None
     calc_to_t2_mapping = {}
 
@@ -1114,37 +1211,51 @@ def visualize_multimodal_case(
                 calc_image_files = sorted(calc_images_dir.glob("*.png"))
                 stats["calc_slices"] = len(calc_image_files)
 
-                # Get Calc DICOM spatial info
+                # Get Calc DICOM directory
                 calc_dicom_dir = find_dicom_series_dir(
                     calc_dicom_base, class_num, case_id, calc_series_uid
                 )
-                calc_spatial = (
-                    extract_dicom_spatial_info(calc_dicom_dir)
-                    if calc_dicom_dir
-                    else None
-                )
-                calc_z_positions = (
-                    extract_slice_locations_from_dicom(calc_dicom_dir)
-                    if calc_dicom_dir
-                    else []
-                )
-
-                # Build Calc index
-                for f in calc_image_files:
-                    calc_images[int(f.stem)] = f
-
-                # Compute T2-to-Calc spatial mapping
-                if t2_z_positions and calc_z_positions:
-                    calc_z_arr = np.array(calc_z_positions)
-                    for t2_idx, t2_z in enumerate(t2_z_positions):
-                        distances = np.abs(calc_z_arr - t2_z)
-                        nearest_calc_idx = int(np.argmin(distances))
-                        min_dist = distances[nearest_calc_idx]
-                        calc_thickness = (
-                            calc_spatial["spacing"][2] if calc_spatial else 3.6
+                
+                # Try to load and resample Calc using native DICOM reader
+                if t2_volume is not None and calc_dicom_dir:
+                    calc_volume = load_dicom_series_as_sitk(calc_dicom_dir)
+                    if calc_volume is not None:
+                        # Resample Calc to T2's coordinate system
+                        calc_resampled = resample_volume_to_reference(
+                            calc_volume, t2_volume, interpolation="linear"
                         )
-                        if min_dist < calc_thickness:
-                            calc_to_t2_mapping[t2_idx] = nearest_calc_idx
+                        calc_resampled_array = sitk.GetArrayFromImage(calc_resampled)
+                        print(f"  ✓ Calc resampled to T2 grid: {calc_resampled.GetSize()}")
+                
+                # Fallback: build PNG index and z-mapping if DICOM approach failed
+                if calc_resampled_array is None:
+                    calc_spatial = (
+                        extract_dicom_spatial_info(calc_dicom_dir)
+                        if calc_dicom_dir
+                        else None
+                    )
+                    calc_z_positions = (
+                        extract_slice_locations_from_dicom(calc_dicom_dir)
+                        if calc_dicom_dir
+                        else []
+                    )
+
+                    # Build Calc index
+                    for f in calc_image_files:
+                        calc_images[int(f.stem)] = f
+
+                    # Compute T2-to-Calc spatial mapping
+                    if t2_z_positions and calc_z_positions:
+                        calc_z_arr = np.array(calc_z_positions)
+                        for t2_idx, t2_z in enumerate(t2_z_positions):
+                            distances = np.abs(calc_z_arr - t2_z)
+                            nearest_calc_idx = int(np.argmin(distances))
+                            min_dist = distances[nearest_calc_idx]
+                            calc_thickness = (
+                                calc_spatial["spacing"][2] if calc_spatial else 3.6
+                            )
+                            if min_dist < calc_thickness:
+                                calc_to_t2_mapping[t2_idx] = nearest_calc_idx
 
     # Load masks
     mask_data = {}  # {structure_name: {slice_idx: mask_array}}
@@ -1191,12 +1302,22 @@ def visualize_multimodal_case(
             continue
 
         # Get corresponding ADC image
+        # Use properly resampled volume if available, otherwise fallback to PNG
         adc_img = None
-        if t2_slice_idx in adc_to_t2_mapping:
+        if adc_resampled_array is not None and t2_slice_idx < adc_resampled_array.shape[0]:
+            # Use the spatially resampled ADC (already aligned to T2 coordinates)
+            adc_img = adc_resampled_array[t2_slice_idx]
+            # Normalize for display
+            if adc_img.max() > 0:
+                adc_img = (adc_img / adc_img.max() * 255).astype(np.uint8)
+            else:
+                adc_img = adc_img.astype(np.uint8)
+        elif t2_slice_idx in adc_to_t2_mapping:
+            # Fallback to PNG-based approach
             adc_idx = adc_to_t2_mapping[t2_slice_idx]
             if adc_idx in adc_images:
                 adc_img = load_image(adc_images[adc_idx])
-                # Resize ADC to T2 dimensions for display
+                # Resize ADC to T2 dimensions for display (not ideal, but fallback)
                 if adc_img is not None and adc_img.shape != t2_img.shape:
                     adc_img = np.array(
                         Image.fromarray(adc_img).resize(
@@ -1205,12 +1326,22 @@ def visualize_multimodal_case(
                     )
 
         # Get corresponding Calc image
+        # Use properly resampled volume if available, otherwise fallback to PNG
         calc_img = None
-        if t2_slice_idx in calc_to_t2_mapping:
+        if calc_resampled_array is not None and t2_slice_idx < calc_resampled_array.shape[0]:
+            # Use the spatially resampled Calc (already aligned to T2 coordinates)
+            calc_img = calc_resampled_array[t2_slice_idx]
+            # Normalize for display
+            if calc_img.max() > 0:
+                calc_img = (calc_img / calc_img.max() * 255).astype(np.uint8)
+            else:
+                calc_img = calc_img.astype(np.uint8)
+        elif t2_slice_idx in calc_to_t2_mapping:
+            # Fallback to PNG-based approach
             calc_idx = calc_to_t2_mapping[t2_slice_idx]
             if calc_idx in calc_images:
                 calc_img = load_image(calc_images[calc_idx])
-                # Resize Calc to T2 dimensions for display
+                # Resize Calc to T2 dimensions for display (not ideal, but fallback)
                 if calc_img is not None and calc_img.shape != t2_img.shape:
                     calc_img = np.array(
                         Image.fromarray(calc_img).resize(
@@ -1234,12 +1365,10 @@ def visualize_multimodal_case(
                     masks_for_slice[struct_name] = mask
 
         # Create figure with 3 rows (T2, ADC, Calc) x 2 cols (Original, Overlay)
-        num_rows = (
-            1
-            + (1 if adc_img is not None or adc_images else 0)
-            + (1 if calc_img is not None or calc_images else 0)
-        )
-        if num_rows == 1 and not adc_images and not calc_images:
+        has_adc_data = adc_img is not None or adc_images or adc_resampled_array is not None
+        has_calc_data = calc_img is not None or calc_images or calc_resampled_array is not None
+        num_rows = 1 + (1 if has_adc_data else 0) + (1 if has_calc_data else 0)
+        if num_rows == 1 and not has_adc_data and not has_calc_data:
             num_rows = 1  # Only T2
         else:
             num_rows = 3  # Always show 3 rows for consistency
@@ -1276,12 +1405,16 @@ def visualize_multimodal_case(
         if num_rows >= 2:
             if adc_img is not None:
                 axes[row, 0].imshow(adc_img, cmap="gray")
-                adc_slice_info = (
-                    f"→T2:{t2_slice_idx}" if t2_slice_idx in adc_to_t2_mapping else ""
-                )
-                axes[row, 0].set_title(
-                    f"ADC (slice {adc_to_t2_mapping.get(t2_slice_idx, '?')}) {adc_slice_info}"
-                )
+                # Show title indicating whether using resampled or fallback
+                if adc_resampled_array is not None and t2_slice_idx < adc_resampled_array.shape[0]:
+                    axes[row, 0].set_title(f"ADC (resampled to T2, slice {t2_slice_idx})")
+                else:
+                    adc_slice_info = (
+                        f"→T2:{t2_slice_idx}" if t2_slice_idx in adc_to_t2_mapping else ""
+                    )
+                    axes[row, 0].set_title(
+                        f"ADC (slice {adc_to_t2_mapping.get(t2_slice_idx, '?')}) {adc_slice_info}"
+                    )
                 axes[row, 0].axis("off")
 
                 # ADC with overlay (using same mask, spatially aligned)
@@ -1332,12 +1465,16 @@ def visualize_multimodal_case(
         if num_rows >= 3:
             if calc_img is not None:
                 axes[row, 0].imshow(calc_img, cmap="gray")
-                calc_slice_info = (
-                    f"→T2:{t2_slice_idx}" if t2_slice_idx in calc_to_t2_mapping else ""
-                )
-                axes[row, 0].set_title(
-                    f"Calc (slice {calc_to_t2_mapping.get(t2_slice_idx, '?')}) {calc_slice_info}"
-                )
+                # Show title indicating whether using resampled or fallback
+                if calc_resampled_array is not None and t2_slice_idx < calc_resampled_array.shape[0]:
+                    axes[row, 0].set_title(f"Calc (resampled to T2, slice {t2_slice_idx})")
+                else:
+                    calc_slice_info = (
+                        f"→T2:{t2_slice_idx}" if t2_slice_idx in calc_to_t2_mapping else ""
+                    )
+                    axes[row, 0].set_title(
+                        f"Calc (slice {calc_to_t2_mapping.get(t2_slice_idx, '?')}) {calc_slice_info}"
+                    )
                 axes[row, 0].axis("off")
 
                 # Calc with overlay

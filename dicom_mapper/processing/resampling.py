@@ -7,8 +7,47 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class VolumeResampler:
     """Handles resampling of volumes to a reference grid using SimpleITK."""
+
+    def load_dicom_series_as_sitk(self, dicom_dir: Path) -> sitk.Image:
+        """
+        Load a DICOM series directly using SimpleITK's native reader.
+        
+        This is the recommended approach as it correctly handles all spatial
+        metadata (origin, spacing, direction) without manual extraction.
+        
+        Args:
+            dicom_dir: Directory containing DICOM files for a single series.
+            
+        Returns:
+            SimpleITK Image with correct spatial metadata.
+        """
+        dicom_dir_str = str(dicom_dir)
+        
+        # Get sorted file names for the series
+        reader = sitk.ImageSeriesReader()
+        dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir_str)
+        
+        if not dicom_names:
+            raise ValueError(f"No DICOM series found in {dicom_dir}")
+        
+        reader.SetFileNames(dicom_names)
+        
+        # Load with metadata
+        reader.MetaDataDictionaryArrayUpdateOn()
+        reader.LoadPrivateTagsOn()
+        
+        volume = reader.Execute()
+        
+        logger.debug(
+            f"Loaded DICOM series from {dicom_dir}: "
+            f"Size={volume.GetSize()}, Spacing={volume.GetSpacing()}, "
+            f"Origin={volume.GetOrigin()}"
+        )
+        
+        return volume
 
     def load_png_series_as_sitk(
         self, 
@@ -75,13 +114,15 @@ class VolumeResampler:
         origin = meta.get("Origin", (0, 0, 0))
         direction = meta.get("ImageOrientationPatient", (1, 0, 0, 0, 1, 0))
         
-        # sitk direction is 3x3 matrix (flattened)
-        # DICOM orientation is two 3D vectors
+        # sitk direction is 3x3 matrix (flattened row-major)
+        # Columns of the matrix are direction cosines for each axis
+        # DICOM ImageOrientationPatient: first 3 = row direction (X), next 3 = column direction (Y)
         if len(direction) == 6:
-            v1 = np.array(direction[:3])
-            v2 = np.array(direction[3:])
-            v3 = np.cross(v1, v2)
-            direction_matrix = np.stack([v1, v2, v3]).flatten().tolist()
+            row_dir = np.array(direction[:3])  # Image X axis direction
+            col_dir = np.array(direction[3:])  # Image Y axis direction
+            slice_dir = np.cross(row_dir, col_dir)  # Image Z axis direction
+            # Stack as columns, then flatten row-major for SimpleITK
+            direction_matrix = np.stack([row_dir, col_dir, slice_dir], axis=1).flatten().tolist()
         else:
             direction_matrix = direction
 

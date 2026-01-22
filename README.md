@@ -73,8 +73,47 @@ tcia-handler/
 └── data/                  # Data directory
 ```
 
-## Outputs (New)
-- `data/aligned_v2/`
-    - `classX/case_Y/`
-        - `t2_aligned.dcm` (Standard Multi-frame DICOM)
-        - `t2/` (Exported PNGs for training)
+## Data Directories
+
+### Source Data (Raw/Preprocessed)
+These directories contain **original, unaligned** data in their native coordinate spaces:
+
+| Directory | Content | Resolution | Aligned? |
+|-----------|---------|------------|----------|
+| `data/processed/` | T2 images (reference) | 256×256 | N/A (reference) |
+| `data/processed_ep2d_adc/` | ADC maps | ~132×160 | ❌ Native ADC space |
+| `data/processed_ep2d_calc/` | Calc maps | ~132×160 | ❌ Native Calc space |
+| `data/processed_seg/` | Segmentation masks | 256×256 | ✅ T2 space |
+| `data/nbia*/` | Original DICOM files | Various | Source metadata |
+
+### Output Data (For AI Training) ✅
+After running the pipeline, use **`data/aligned_v2/`** for training:
+
+```
+data/aligned_v2/class{N}/case_{XXXX}/
+├── t2/              # ✅ PNG files for AI training
+├── adc/             # ✅ PNG files for AI training (resampled to T2)
+├── calc/            # ✅ PNG files for AI training (resampled to T2)
+├── mask_prostate/   # ✅ Mask PNG files
+├── mask_target1/    # ✅ Mask PNG files
+├── t2_aligned/      # DICOM files (*.dcm) - for archival/PACS
+├── adc_aligned/     # DICOM files (*.dcm) - for archival/PACS
+└── calc_aligned/    # DICOM files (*.dcm) - for archival/PACS
+```
+
+**For AI training**: Use `t2/`, `adc/`, `calc/`, `mask_*/` (PNG files).
+
+**Slice correspondence**: `t2/0025.png`, `adc/0025.png`, `calc/0025.png`, and `mask_prostate/0025.png` all correspond to the **same physical location** in T2's coordinate system.
+
+### Visualization Only
+The `visualize_overlay_masks.py` script resamples on-the-fly for verification—it does NOT modify source directories:
+
+```bash
+# Verify alignment visually (reads DICOMs, resamples in memory)
+python tools/preprocessing/visualize_overlay_masks.py --multimodal
+```
+
+## Why Spatial Resampling?
+T2, ADC, and Calc have different resolutions, origins, and field-of-view. Simple pixel resizing causes misalignment. The pipeline uses **SimpleITK's native DICOM reader** to correctly transform ADC/Calc to T2's coordinate system using DICOM spatial metadata (origin, spacing, direction).
+
+See [docs/dicom_mapping.md](docs/dicom_mapping.md) for technical details.

@@ -111,8 +111,13 @@ def load_modality_volume(
     modality_dicom_name: str,
     resampler: VolumeResampler,
 ):
-    """Helper to load a modality's volume and DICOM datasets."""
-    # 1. Find Processed Images
+    """
+    Helper to load a modality's volume and DICOM datasets.
+    
+    Uses SimpleITK's native DICOM reader to ensure correct spatial metadata
+    (origin, spacing, direction) without manual extraction.
+    """
+    # 1. Find the processed directory to get the SeriesInstanceUID
     processed_base = (
         root_dir / modality_processed_name / f"class{class_num}" / f"case_{case_id}"
     )
@@ -125,45 +130,63 @@ def load_modality_volume(
     if not series_dirs:
         logger.debug(f"No series dirs found in {processed_base}")
         return None, None
-    processed_dir = series_dirs[0] / "images"
+    
+    # The series directory name is the SeriesInstanceUID
+    target_series_uid = series_dirs[0].name
 
-    # 2. Find DICOMs
+    # 2. Find DICOM directory
     dicom_root = root_dir / modality_dicom_name / f"class{class_num}"
-    # Robust search for case ID in DICOM structure
+    
+    # Search for DICOM files matching the case
     dicom_files = list(dicom_root.rglob(f"**/*{case_id}*/**/*.dcm"))
-
+    
     if not dicom_files:
-        # Try finding by series UID if possible, but for now rely on case_id path matching
         logger.warning(
             f"DICOMs not found for {modality_dicom_name} case {case_id} in {dicom_root}"
         )
         return None, None
 
-    # Filter DICOMs for the specific series if we have multiple
-    # (Simplified: take the first series found for this case)
-    # Ideally we match SeriesInstanceUID from processed_dir.parent.name
-    target_uid = processed_dir.parent.name
+    # Find the DICOM directory that matches our target SeriesInstanceUID
+    dicom_dir = None
+    checked_dirs = set()
+    
+    for dcm_file in dicom_files:
+        parent_dir = dcm_file.parent
+        if parent_dir in checked_dirs:
+            continue
+        checked_dirs.add(parent_dir)
+        
+        try:
+            # Check if this directory contains our target series
+            ds = pydicom.dcmread(str(dcm_file), stop_before_pixels=True)
+            if getattr(ds, "SeriesInstanceUID", "") == target_series_uid:
+                dicom_dir = parent_dir
+                break
+        except Exception:
+            continue
+    
+    # Fallback to first DICOM directory if no exact match
+    if dicom_dir is None:
+        dicom_dir = dicom_files[0].parent
+        logger.debug(
+            f"No exact SeriesInstanceUID match for {target_series_uid}, "
+            f"using {dicom_dir}"
+        )
 
-    # Find the directory that contains files with this UID
-    # We'll just load the first consistent series we find for now
-    dicoms = load_dicom_series(dicom_files[0].parent)
+    # 3. Load volume using SimpleITK's native DICOM reader
+    # This correctly handles all spatial metadata (origin, spacing, direction)
+    try:
+        volume = resampler.load_dicom_series_as_sitk(dicom_dir)
+    except Exception as e:
+        logger.warning(f"Failed to load DICOM series from {dicom_dir}: {e}")
+        return None, None
 
-    # Verify UID match if strictly needed, but let's trust the case-level folder for now
-
-    # 3. Load Volume
-    spacing = (
-        float(dicoms[0].PixelSpacing[0]),
-        float(dicoms[0].PixelSpacing[1]),
-        float(dicoms[0].SliceThickness),
-    )
-    origin = dicoms[0].ImagePositionPatient
-
-    # Handle direction if available
-    direction = getattr(dicoms[0], "ImageOrientationPatient", None)
-
-    volume = resampler.load_png_series_as_sitk(
-        processed_dir, spacing, origin, direction
-    )
+    # 4. Also load pydicom datasets for metadata (needed for highdicom output)
+    dicoms = load_dicom_series(dicom_dir)
+    
+    if not dicoms:
+        logger.warning(f"Failed to load pydicom datasets from {dicom_dir}")
+        return None, None
 
     return volume, dicoms
 

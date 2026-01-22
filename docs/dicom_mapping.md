@@ -13,6 +13,8 @@ ADC: 132×160×20  @ 1.625mm spacing  → Resampled to 256×256×60
 
 **Key Insight**: Both images share the same world coordinate system (LPS mm). The spatial metadata (origin, spacing, direction from DICOM) enables coordinate-based resampling—NOT simple pixel resizing.
 
+**Implementation**: We use **SimpleITK's native DICOM reader** (`sitk.ImageSeriesReader`) to load volumes with correct spatial metadata, then resample ADC/Calc to T2's grid using `sitk.ResampleImageFilter`.
+
 ---
 
 ## Quick Start
@@ -121,8 +123,27 @@ for t2_idx, t2_z in enumerate(t2_z_positions):
 
 ### 3. The Resampling Process
 
+#### Why Native DICOM Reader?
+
+Loading PNGs with manually extracted metadata can cause subtle misalignment due to:
+- Incorrect direction matrix construction (6→9 element conversion)
+- Per-slice origin variations not captured by first-slice-only extraction
+- Mismatch between PNG geometry and DICOM spatial metadata
+
+**Solution**: Use `sitk.ImageSeriesReader` to read DICOMs directly:
+
 ```python
-# Core code in dicom_mapper/processing/resampling.py
+# dicom_mapper/processing/resampling.py - load_dicom_series_as_sitk()
+reader = sitk.ImageSeriesReader()
+dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
+reader.SetFileNames(dicom_names)
+volume = reader.Execute()  # All spatial metadata handled correctly
+```
+
+#### The Resampling Step
+
+```python
+# dicom_mapper/processing/resampling.py - resample_to_reference()
 resampler = sitk.ResampleImageFilter()
 resampler.SetReferenceImage(t2_volume)    # T2 defines output grid
 resampler.SetTransform(sitk.Transform())  # Identity - metadata handles mapping
@@ -138,22 +159,6 @@ result = resampler.Execute(adc_volume)    # ADC now matches T2 dimensions
 | \`ImagePositionPatient\` | Origin (x, y, z) of first voxel |
 | \`ImageOrientationPatient\` | Direction cosines (6 values → 3×3 matrix) |
 
----
-
-## Debugging Breakpoints
-
-| Priority | File | Line | What to Check |
-|----------|------|------|---------------|
-| 🔴 | \`pipeline.py\` | **248** | \`adc_resampled.GetSize()\` should match T2 |
-| 🔴 | \`resampling.py\` | **63** | Core resampling - compare sizes |
-| 🟡 | \`pipeline.py\` | **154** | DICOM spacing/origin extraction |
-
-```python
-# Quick debug commands
-img.GetSize()      # (X, Y, Z) dimensions
-img.GetSpacing()   # (Δx, Δy, Δz) in mm
-img.GetOrigin()    # First voxel position
-```
 
 ---
 
@@ -165,14 +170,27 @@ Everything below provides in-depth explanations, diagrams, and implementation de
 
 ## Data Structure Overview
 
-### Processed Directories
+### Source vs Output Directories
+
+| Directory | Content | Aligned to T2? | Use For |
+|-----------|---------|----------------|---------|
+| `data/processed/` | T2 PNGs | N/A (reference) | Source only |
+| `data/processed_ep2d_adc/` | ADC PNGs (native) | ❌ No | Source only |
+| `data/processed_ep2d_calc/` | Calc PNGs (native) | ❌ No | Source only |
+| `data/processed_seg/` | Mask PNGs | ✅ Yes | Source only |
+| `data/nbia*/` | Original DICOMs | N/A | Spatial metadata |
+| **`data/aligned_v2/`** | **Resampled PNGs** | **✅ Yes** | **AI Training** |
+
+**Important**: For AI training, use `data/aligned_v2/` where all modalities share the same coordinate system.
+
+### Processed Directories (Source)
 
 | Directory | Content | Description |
 |-----------|---------|-------------|
-| \`data/processed/\` | T2-weighted images | High-resolution anatomical reference |
-| \`data/processed_ep2d_adc/\` | ADC maps | Apparent Diffusion Coefficient from DWI |
-| \`data/processed_ep2d_calc/\` | Calculated DWI | Derived diffusion images |
-| \`data/processed_seg/\` | Segmentation masks | Prostate & target ROI masks |
+| `data/processed/` | T2-weighted images | High-resolution anatomical reference |
+| `data/processed_ep2d_adc/` | ADC maps | Apparent Diffusion Coefficient from DWI |
+| `data/processed_ep2d_calc/` | Calculated DWI | Derived diffusion images |
+| `data/processed_seg/` | Segmentation masks | Prostate & target ROI masks |
 
 ### Directory Structure
 
@@ -259,14 +277,19 @@ Pipeline pads to full T2 dimensions with zeros.
 ### Common Issues
 
 1. **Missing ADC/Calc**: Not all cases have diffusion sequences
-2. **Misaligned masks**: Use full spatial transformation, not simple resize
-3. **SCImage error**: Split 3D into 2D slices
-4. **Masks not visible**: Check padding and filename alignment
-5. **ADC matches but Calc doesn't** (or vice versa):
+2. **Misaligned masks on ADC/Calc**: 
+   - **Cause**: Simple pixel resize instead of proper spatial transformation
+   - **Fix**: Use native DICOM reader (`sitk.ImageSeriesReader`) + `ResampleImageFilter`
+3. **Slight mask misalignment** (off by a few pixels):
+   - **Cause**: Manual metadata extraction (direction matrix, per-slice origins)
+   - **Fix**: Use `load_dicom_series_as_sitk()` instead of PNG + manual metadata
+4. **SCImage error**: Split 3D into 2D slices
+5. **Masks not visible**: Check padding and filename alignment
+6. **ADC matches but Calc doesn't** (or vice versa):
    - **Cause**: Multiple series per case with different `StudyInstanceUID`
    - Alphabetical selection may pick series from wrong study
    - **Fix**: Match by `StudyInstanceUID` (see Core Concepts §1)
-6. **ADC/Calc shows "Not Available" for some T2 slices**:
+7. **ADC/Calc shows "Not Available" for some T2 slices**:
    - **Cause**: T2 z-range extends beyond ADC/Calc coverage
    - This is **correct behavior** - no ADC data exists for those slices
    - Check z-ranges: T2 may have 60 slices, ADC only covers middle 40
