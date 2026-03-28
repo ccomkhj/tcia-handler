@@ -17,7 +17,7 @@ uv sync
 ```
 
 ### 🛠️ Usage: Mapping & Alignment
-Use the new CLI to align sequences, generate Standard DICOMs (Secondary Capture/Segmentation), and export training-ready PNGs.
+Use the new CLI to align sequences, generate Secondary Capture DICOM series for aligned image volumes, and export training-ready PNGs plus mask PNGs.
 
 ```bash
 # Process all cases (Align -> DICOM -> PNG)
@@ -41,21 +41,28 @@ uv run dicom-mapper visualize --aligned-dir data/aligned_v2 --output-dir data/vi
 ---
 
 ## Legacy Scripts (Data Prep)
-The following scripts handle initial data download and preparation.
+The following scripts handle data preparation around the external MRI dataset. DICOM download itself remains a manual NBIA Data Retriever step.
 
 ```bash
-# Full preprocessing pipeline (Steps 1-6)
+# Run the automated preprocessing pipeline
 python service/preprocess.py --all
 
 # Individual preprocessing steps
 python service/preprocess.py --step excel_to_parquet
+python service/preprocess.py --step generate_ignore_list
 python service/preprocess.py --step merge_datasets
 python service/preprocess.py --step generate_tcia
 python service/preprocess.py --step dicom_to_png
 python service/preprocess.py --step process_overlays
+python service/preprocess.py --step validate_2d5
+
+# Point preprocessing at an external MRI workspace if needed
+python service/preprocess.py --all --mri-root /path/to/mri
 ```
 
-**Note:** `service/mapping.py` is **deprecated**. Please use `uv run dicom-mapper` instead.
+`python service/preprocess.py --all` skips the TCIA manifest step by default because it requires manual NBIA follow-up. Run `--step generate_tcia` explicitly when you need fresh `.tcia` files.
+
+**Note:** `service/mapping.py` is deprecated. Prefer `uv run dicom-mapper`.
 
 ## Project Structure
 
@@ -96,9 +103,9 @@ data/aligned_v2/class{N}/case_{XXXX}/
 ├── calc/            # ✅ PNG files for AI training (resampled to T2)
 ├── mask_prostate/   # ✅ Mask PNG files
 ├── mask_target1/    # ✅ Mask PNG files
-├── t2_aligned/      # DICOM files (*.dcm) - for archival/PACS
-├── adc_aligned/     # DICOM files (*.dcm) - for archival/PACS
-└── calc_aligned/    # DICOM files (*.dcm) - for archival/PACS
+├── t2_aligned/      # Secondary Capture DICOM files (*.dcm)
+├── adc_aligned/     # Secondary Capture DICOM files (*.dcm)
+└── calc_aligned/    # Secondary Capture DICOM files (*.dcm)
 ```
 
 **For AI training**: Use `t2/`, `adc/`, `calc/`, `mask_*/` (PNG files).

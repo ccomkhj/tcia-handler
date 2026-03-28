@@ -1,379 +1,138 @@
 # DICOM Multi-Modal Mapping Guide
 
-## TL;DR
-
-**Problem**: T2, ADC, and Calc MRI sequences have different resolutions and spatial positions.
-
-**Solution**: Use SimpleITK to resample ADC/Calc to T2's grid using DICOM spatial metadata.
-
-```
-T2:  256×256×60  @ 0.664mm spacing  ← Reference
-ADC: 132×160×20  @ 1.625mm spacing  → Resampled to 256×256×60
-```
-
-**Key Insight**: Both images share the same world coordinate system (LPS mm). The spatial metadata (origin, spacing, direction from DICOM) enables coordinate-based resampling—NOT simple pixel resizing.
-
-**Implementation**: We use **SimpleITK's native DICOM reader** (`sitk.ImageSeriesReader`) to load volumes with correct spatial metadata, then resample ADC/Calc to T2's grid using `sitk.ResampleImageFilter`.
-
----
+This guide describes the current `dicom_mapper` pipeline in this repository. It focuses on what `uv run dicom-mapper process` does today, which inputs it expects, and where the aligned outputs come from.
 
 ## Quick Start
 
-### Commands
-
 ```bash
-# Align T2 + ADC + Calc + Masks
+# Align all discovered cases
 uv run dicom-mapper process --input-dir data --output-dir data/aligned_v2
 
-# Process single case
+# Restrict processing to one class
+uv run dicom-mapper process --input-dir data --output-dir data/aligned_v2 --class-num 1
+
+# Process one case
 uv run dicom-mapper process --input-dir data --output-dir data/aligned_v2 --class-num 1 --case-id 0144
 
-# Visualize alignment
+# Render visual QA output from an aligned directory
 uv run dicom-mapper visualize --aligned-dir data/aligned_v2 --output-dir data/visualizations_v2
-
-# Multi-modal side-by-side visualization (T2 + ADC + masks)
-python tools/preprocessing/visualize_overlay_masks.py --multimodal
 ```
 
-### Output Structure
+For additional manual QA, `python tools/preprocessing/visualize_overlay_masks.py --multimodal` still exists, but it is a separate inspection script and not the implementation behind `dicom-mapper process`.
 
-```
+## Required Inputs
+
+The CLI expects a root directory with these subtrees:
+
+| Path | Purpose |
+|------|---------|
+| `data/processed/` | T2 PNG stacks grouped by `class*/case_*/{SeriesInstanceUID}` |
+| `data/processed_ep2d_adc/` | ADC PNG stacks in native ADC space |
+| `data/processed_ep2d_calc/` | Calc PNG stacks in native Calc space |
+| `data/processed_seg/` | Mask PNG slices grouped by case and series UID |
+| `data/nbia/` | Original T2 DICOM directories |
+| `data/nbia_ep2d_adc/` | Original ADC DICOM directories |
+| `data/nbia_ep2d_calc/` | Original Calc DICOM directories |
+
+The processed PNG folders are used to discover cases and series UIDs. The original DICOM folders provide the geometry used for spatially correct resampling.
+
+## Output Structure
+
+```text
 data/aligned_v2/class{N}/case_{XXXX}/
-├── t2/           # 60 aligned PNG slices
-├── adc/          # 60 aligned PNG slices (resampled to T2)
-├── calc/         # 60 aligned PNG slices (resampled to T2)
-├── mask_prostate/ # 60 mask PNG slices (padded)
-└── mask_target1/  # 60 mask PNG slices (padded)
+├── t2/              # PNG slices for training
+├── adc/             # ADC resampled to the T2 grid
+├── calc/            # Calc resampled to the T2 grid
+├── mask_prostate/   # Full-volume mask PNGs
+├── mask_target1/    # Full-volume mask PNGs
+├── t2_aligned/      # Secondary Capture DICOM slices
+├── adc_aligned/     # Secondary Capture DICOM slices
+└── calc_aligned/    # Secondary Capture DICOM slices
 ```
 
----
+Training code should use the PNG folders and `metadata.json`. The `*_aligned/` directories are inspection and archival outputs, not the training input format.
 
-## Core Concepts
+## How the Current Pipeline Matches Data
 
-### 1. Sequence Linking
+The mapper currently works as follows:
 
-T2 and ADC are linked by **`case_id`** AND **`StudyInstanceUID`**:
-- Same `case_id` folder: `data/processed/class1/case_0144/` ↔ `data/processed_ep2d_adc/class1/case_0144/`
-- **CRITICAL**: Must also match `StudyInstanceUID` from `meta.json`
+1. Discover cases from `data/processed/class*/case_*`.
+2. For each modality, look inside that case directory and take the first discovered series folder.
+3. Treat that folder name as the target `SeriesInstanceUID`.
+4. Search the corresponding DICOM tree for files from the same case and prefer the directory whose DICOM `SeriesInstanceUID` matches the target folder name.
+5. If no exact DICOM match is found, fall back to the first discovered DICOM directory for that case.
 
-#### Multi-Series Per Case
+For masks, the pipeline looks in `data/processed_seg/class{N}/case_{XXXX}/`. If a segmentation series directory matches the T2 `SeriesInstanceUID`, it uses that. Otherwise it falls back to the first segmentation series directory.
 
-Some cases have **multiple imaging studies** (different `StudyInstanceUID`), each with its own T2/ADC/Calc:
+This is important: the current CLI assumes one relevant processed series per modality and case. If a case contains multiple candidate series, the first discovered directory wins and the result should be reviewed.
 
-```
-case_0044/
-├── 1.3.6.1.4.1...229... (StudyUID: 236806...)  ← Study A
-└── 1.3.6.1.4.1...572... (StudyUID: 260314...)  ← Study B
-```
+## Why Resampling Works
 
-**⚠️ Pitfall**: Alphabetical ordering may pick ADC from Study A while T2 is from Study B. Their z-coordinates won't align!
+Simple pixel resizing is not enough because T2, ADC, and Calc usually differ in:
 
-**Solution**: Match by `StudyInstanceUID`:
+- pixel spacing
+- slice spacing
+- image origin
+- image direction
+
+The pipeline reads the original DICOM series with `SimpleITK.ImageSeriesReader`, which preserves spatial metadata, then resamples ADC and Calc into T2 space with `SimpleITK.ResampleImageFilter`.
 
 ```python
-def select_matching_series(series_dirs, t2_study_uid):
-    """Select series with matching StudyInstanceUID."""
-    for series_dir in series_dirs:
-        meta = json.loads((series_dir / "meta.json").read_text())
-        if meta.get("StudyInstanceUID") == t2_study_uid:
-            return series_dir
-    return series_dirs[0]  # Fallback
-```
-
-📁 **Implementation**: `tools/preprocessing/visualize_overlay_masks.py` line ~1032
-
-### 2. Spatial Alignment
-
-**Why simple resize doesn't work**: T2 and ADC have different:
-- Origins (where the image starts in space)
-- Spacings (pixel/voxel size in mm)
-- Fields of view (z-range coverage)
-
-**Solution**: Use DICOM spatial metadata to transform through world coordinates:
-
-```
-Voxel (i,j,k) → World (x,y,z) mm → Voxel (i',j',k')
-```
-
-#### Z-Position Mapping
-
-T2 and ADC/Calc may have **different z-coverage**:
-
-```
-T2:   z-range [-27.79, 60.71]  (60 slices)
-ADC:  z-range [-17.74, 50.66]  (20 slices)
-                ↑
-         Overlap: [-17.74, 50.66]
-```
-
-**Mapping algorithm**:
-1. For each T2 slice, find nearest ADC slice by z-position
-2. Only create mapping if distance < `slice_thickness` (~3.6mm)
-3. T2 slices outside ADC z-range show "Not Available"
-
-```python
-# Z-position mapping
-for t2_idx, t2_z in enumerate(t2_z_positions):
-    distances = np.abs(adc_z_arr - t2_z)
-    nearest_idx = int(np.argmin(distances))
-    if distances[nearest_idx] < adc_thickness:
-        mapping[t2_idx] = nearest_idx  # Valid mapping
-    # else: no ADC for this T2 slice
-```
-
-### 3. The Resampling Process
-
-#### Why Native DICOM Reader?
-
-Loading PNGs with manually extracted metadata can cause subtle misalignment due to:
-- Incorrect direction matrix construction (6→9 element conversion)
-- Per-slice origin variations not captured by first-slice-only extraction
-- Mismatch between PNG geometry and DICOM spatial metadata
-
-**Solution**: Use `sitk.ImageSeriesReader` to read DICOMs directly:
-
-```python
-# dicom_mapper/processing/resampling.py - load_dicom_series_as_sitk()
 reader = sitk.ImageSeriesReader()
-dicom_names = reader.GetGDCMSeriesFileNames(dicom_dir)
-reader.SetFileNames(dicom_names)
-volume = reader.Execute()  # All spatial metadata handled correctly
-```
+reader.SetFileNames(reader.GetGDCMSeriesFileNames(str(dicom_dir)))
+volume = reader.Execute()
 
-#### The Resampling Step
-
-```python
-# dicom_mapper/processing/resampling.py - resample_to_reference()
 resampler = sitk.ResampleImageFilter()
-resampler.SetReferenceImage(t2_volume)    # T2 defines output grid
-resampler.SetTransform(sitk.Transform())  # Identity - metadata handles mapping
-result = resampler.Execute(adc_volume)    # ADC now matches T2 dimensions
-```
-
-### 4. Key DICOM Tags
-
-| Tag | Purpose |
-|-----|---------|
-| \`PixelSpacing\` | In-plane resolution (row, col) in mm |
-| \`SliceThickness\` | Z-axis spacing in mm |
-| \`ImagePositionPatient\` | Origin (x, y, z) of first voxel |
-| \`ImageOrientationPatient\` | Direction cosines (6 values → 3×3 matrix) |
-
-
----
-
-# Detailed Documentation
-
-Everything below provides in-depth explanations, diagrams, and implementation details.
-
----
-
-## Data Structure Overview
-
-### Source vs Output Directories
-
-| Directory | Content | Aligned to T2? | Use For |
-|-----------|---------|----------------|---------|
-| `data/processed/` | T2 PNGs | N/A (reference) | Source only |
-| `data/processed_ep2d_adc/` | ADC PNGs (native) | ❌ No | Source only |
-| `data/processed_ep2d_calc/` | Calc PNGs (native) | ❌ No | Source only |
-| `data/processed_seg/` | Mask PNGs | ✅ Yes | Source only |
-| `data/nbia*/` | Original DICOMs | N/A | Spatial metadata |
-| **`data/aligned_v2/`** | **Resampled PNGs** | **✅ Yes** | **AI Training** |
-
-**Important**: For AI training, use `data/aligned_v2/` where all modalities share the same coordinate system.
-
-### Processed Directories (Source)
-
-| Directory | Content | Description |
-|-----------|---------|-------------|
-| `data/processed/` | T2-weighted images | High-resolution anatomical reference |
-| `data/processed_ep2d_adc/` | ADC maps | Apparent Diffusion Coefficient from DWI |
-| `data/processed_ep2d_calc/` | Calculated DWI | Derived diffusion images |
-| `data/processed_seg/` | Segmentation masks | Prostate & target ROI masks |
-
-### Directory Structure
-
-```
-data/processed/class{N}/case_{XXXX}/{SeriesInstanceUID}/
-├── images/
-│   ├── 0000.png
-│   └── ...
-└── meta.json
-
-data/processed_seg/class{N}/case_{XXXX}/{SeriesInstanceUID}/
-├── prostate/
-│   └── 0010.png ...
-├── target1/
-│   └── 0014.png ...
-└── biopsies.json
-```
-
----
-
-## DICOM Spatial Properties
-
-### T2-Weighted Series
-- **Pixel Spacing**: 0.664mm × 0.664mm
-- **Slice Thickness**: 1.5mm
-- **Image Size**: 256 × 256
-- **Typical Slice Count**: 50-60
-
-### ADC / Calc Series
-- **Pixel Spacing**: 1.625mm × 1.625mm
-- **Slice Thickness**: 3.6mm
-- **Image Size**: 132 × 160
-- **Typical Slice Count**: 20
-
-### Key Observations
-1. **Resolution Ratio**: T2 is ~2.5× higher resolution than ADC/Calc
-2. **Z-Spacing Ratio**: T2 has ~2.4× more slices (1.5mm vs 3.6mm spacing)
-3. **Different FOV**: T2 and ADC/Calc may start at different z-positions
-
----
-
-## Linking Keys
-
-### StudyInstanceUID (Primary Link)
-All sequences from the same imaging session share the same \`StudyInstanceUID\`.
-
-### Coordinate System (LPS)
-DICOM uses the **LPS** (Left-Posterior-Superior) coordinate system:
-- **L**: Patient's left (positive X direction)
-- **P**: Patient's posterior (positive Y direction)  
-- **S**: Patient's superior/head (positive Z direction)
-
-### IJK to World Transformation
-
-```
-[x]   [Xx*Δi  Yx*Δj  Zx*Δk  Sx]   [i]
-[y] = [Xy*Δi  Yy*Δj  Zy*Δk  Sy] × [j]
-[z]   [Xz*Δi  Yz*Δj  Zz*Δk  Sz]   [k]
-[1]   [0      0      0      1 ]   [1]
-```
-
----
-
-## Implementation Details
-
-### Why Per-Slice DICOMs?
-\`highdicom.sc.SCImage\` only supports 2D grayscale arrays. 3D arrays are interpreted as RGB.
-
-**Solution**: Split into 2D slices, one SCImage per slice, sharing same SeriesInstanceUID.
-
-### Mask Handling
-Masks in \`processed_seg/\` only cover slices with segmentation (e.g., slices 21-49).
-Pipeline pads to full T2 dimensions with zeros.
-
-### Key Dependencies
-- **highdicom**: DICOM Secondary Capture images
-- **SimpleITK**: Spatial resampling
-- **pydicom**: DICOM metadata
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Missing ADC/Calc**: Not all cases have diffusion sequences
-2. **Misaligned masks on ADC/Calc**: 
-   - **Cause**: Simple pixel resize instead of proper spatial transformation
-   - **Fix**: Use native DICOM reader (`sitk.ImageSeriesReader`) + `ResampleImageFilter`
-3. **Slight mask misalignment** (off by a few pixels):
-   - **Cause**: Manual metadata extraction (direction matrix, per-slice origins)
-   - **Fix**: Use `load_dicom_series_as_sitk()` instead of PNG + manual metadata
-4. **SCImage error**: Split 3D into 2D slices
-5. **Masks not visible**: Check padding and filename alignment
-6. **ADC matches but Calc doesn't** (or vice versa):
-   - **Cause**: Multiple series per case with different `StudyInstanceUID`
-   - Alphabetical selection may pick series from wrong study
-   - **Fix**: Match by `StudyInstanceUID` (see Core Concepts §1)
-7. **ADC/Calc shows "Not Available" for some T2 slices**:
-   - **Cause**: T2 z-range extends beyond ADC/Calc coverage
-   - This is **correct behavior** - no ADC data exists for those slices
-   - Check z-ranges: T2 may have 60 slices, ADC only covers middle 40
-
-### Validation Checklist
-- [ ] `StudyInstanceUID` matches across T2, ADC, Calc
-- [ ] Resampled ADC/Calc match T2 dimensions
-- [ ] Mask indices align with T2 slice indices
-- [ ] Masks visually align with anatomy
-- [ ] Z-overlap region has valid mappings
-
----
-
-## Code Walkthrough with Debugging Breakpoints
-
-### Part 1: Sequence Mapping
-
-📁 **File:** \`dicom_mapper/cli/pipeline.py\`
-
-```python
-# Line 225-227: Load T2 as REFERENCE
-t2_volume, t2_datasets = load_modality_volume(
-    case_id, class_num, root_dir, "processed", "nbia", resampler
-)
-
-# Line 242-244: Load ADC for SAME case_id
-adc_volume, adc_datasets = load_modality_volume(
-    case_id, class_num, root_dir, "processed_ep2d_adc", "nbia_ep2d_adc", resampler
-)
-```
-
-### Part 2: The Core Resampling
-
-📁 **File:** \`dicom_mapper/processing/resampling.py\`
-
-```python
-# Line 63-68: THE KEY FUNCTION
-resampler = sitk.ResampleImageFilter()
-resampler.SetReferenceImage(reference)      # T2 defines output grid
-resampler.SetInterpolator(interpolator)
+resampler.SetReferenceImage(t2_volume)
+resampler.SetInterpolator(sitk.sitkLinear)
 resampler.SetDefaultPixelValue(0)
-resampler.SetTransform(sitk.Transform())    # Identity - metadata handles mapping!
-
-return resampler.Execute(moving)  # Returns ADC on T2's grid
+resampler.SetTransform(sitk.Transform())
+aligned_adc = resampler.Execute(adc_volume)
 ```
 
-### Part 3: What Happens Inside
+The default fill value is `0`, so regions outside the ADC or Calc field of view become zero-valued voxels in the aligned output. The current mapper does not emit a `"Not Available"` sentinel image.
 
-```
-For each output voxel (i, j, k) in T2 grid:
-    1. Compute world coords: (x, y, z) = T2_matrix × (i, j, k, 1)
-    2. Find ADC voxel: (i', j', k') = ADC_matrix⁻¹ × (x, y, z, 1)
-    3. Interpolate ADC value at (i', j', k')
-    4. Store in output[i, j, k]
-```
+## Mask Handling
 
-### Debug Session Checklist
+`data/processed_seg/` usually contains only slices where a structure is present. The mapper expands those sparse slices into a full T2-length volume:
 
-| Step | File | Line | What to Check |
-|------|------|------|---------------|
-| 1 | \`pipeline.py\` | 225 | T2 volume loaded |
-| 2 | \`pipeline.py\` | 242 | ADC volume loaded |
-| 3 | \`pipeline.py\` | 154 | Spacing/origin from DICOM |
-| 4 | \`resampling.py\` | 63 | Core resampling |
-| 5 | \`pipeline.py\` | 248 | ADC matches T2 dimensions |
+- start with an all-zero mask volume matching T2 dimensions
+- load each saved mask PNG by slice number
+- resize with nearest-neighbor only if dimensions differ
+- write the full mask volume back out as `mask_<name>/0000.png`, `0001.png`, ...
 
-### Quick Debug Commands
+The resulting mask directories always follow T2 slice numbering.
+
+## DICOM Output Notes
+
+The mapper writes aligned image DICOMs as per-slice Secondary Capture instances. `highdicom.sc.SCImage` is used one frame at a time, so each aligned series becomes a directory of `.dcm` files that share a series UID.
+
+There is a helper for DICOM SEG creation in `dicom_mapper/core/highdicom_creation.py`, but the CLI does not currently call it. Mask outputs are PNG only.
+
+## Known Limitations
+
+- Cross-modality matching is not currently based on `StudyInstanceUID` inside the main CLI.
+- Multi-series cases may require manual validation because the first processed series directory is selected.
+- If exact DICOM series matching fails, the CLI falls back to the first DICOM directory found for the case.
+- ADC and Calc are resampled with linear interpolation. Masks are kept discrete via PNG export and nearest-neighbor resize when needed.
+
+## Validation Checklist
+
+- Run `uv run dicom-mapper visualize --aligned-dir data/aligned_v2 --output-dir data/visualizations_v2`.
+- Confirm slice counts match across `t2/`, `adc/`, `calc/`, and each `mask_*` directory for a case.
+- Spot-check cases with multiple source series directories.
+- Inspect geometry in Python when debugging:
 
 ```python
-img.GetSize()      # (X, Y, Z) dimensions
-img.GetSpacing()   # (Δx, Δy, Δz) in mm
-img.GetOrigin()    # First voxel position
-img.GetDirection() # 9-element direction matrix
-
-arr = sitk.GetArrayFromImage(img)
-arr.shape  # (Z, Y, X) - note axis order!
+img.GetSize()
+img.GetSpacing()
+img.GetOrigin()
+img.GetDirection()
 ```
 
----
+## Related Files
 
-## Lessons from 3D Slicer
-
-1. **Full IJK-to-World Matrix**: 4×4 transformation for voxel → physical coordinates
-2. **Coordinate System Consistency**: LPS for DICOM/ITK, RAS for Slicer
-3. **Reference-Based Resampling**: One image as reference, others resampled to match
-4. **Direction Cosines Matter**: ImageOrientationPatient essential for alignment
-5. **Nearest Neighbor for Masks**: Preserve binary values during resampling
+- `dicom_mapper/cli/pipeline.py`: end-to-end orchestration
+- `dicom_mapper/processing/resampling.py`: DICOM loading and resampling
+- `dicom_mapper/core/highdicom_creation.py`: Secondary Capture helpers
+- `docs/train.md`: training dataset and metadata format

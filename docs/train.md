@@ -24,15 +24,17 @@ data/aligned_v2/
 │   │   ├── calc/            # Calc PNG images (resampled to T2 grid)
 │   │   ├── mask_prostate/   # Prostate segmentation masks
 │   │   ├── mask_target1/    # Target lesion masks
-│   │   ├── t2_aligned/      # DICOM files (for archival)
-│   │   ├── adc_aligned/     # DICOM files (for archival)
-│   │   └── calc_aligned/    # DICOM files (for archival)
+│   │   ├── t2_aligned/      # Secondary Capture DICOM slices
+│   │   ├── adc_aligned/     # Secondary Capture DICOM slices
+│   │   └── calc_aligned/    # Secondary Capture DICOM slices
 │   └── case_XXXX/
 ├── class2/
 ├── class3/
 ├── class4/
 └── metadata.json            # Training metadata
 ```
+
+For training, consume `t2/`, `adc/`, `calc/`, `mask_*/`, and `metadata.json`. The `*_aligned/` directories are not used by the metadata generator.
 
 ## Metadata File
 
