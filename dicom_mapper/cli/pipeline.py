@@ -1,4 +1,5 @@
 import logging
+import tempfile
 from pathlib import Path
 
 import click
@@ -13,6 +14,13 @@ from dicom_mapper.core.geometry import SeriesInfo, compute_slice_mapping
 from dicom_mapper.core.highdicom_creation import create_sc_image, create_segmentation
 from dicom_mapper.io.dicom import extract_slice_locations_from_dicom, load_dicom_series
 from dicom_mapper.io.export import PNGExporter
+from dicom_mapper.io.vendor import (
+    case_name_from_zip,
+    classify_series,
+    extract_zip,
+    find_dicomdir,
+    get_series_info,
+)
 from dicom_mapper.processing.resampling import VolumeResampler
 from dicom_mapper.processing.visualization import AlignedVisualizer
 
@@ -43,24 +51,30 @@ def cli():
     help="Directory to save visualizations",
 )
 @click.option("--class-num", type=int, help="Filter by specific class (1-4)")
-def visualize(aligned_dir, output_dir, class_num):
+@click.option("--group", type=str, help="Filter by group directory name (e.g. sample)")
+def visualize(aligned_dir, output_dir, class_num, group):
     """Visualize aligned data (Overlays on T2/ADC/Calc)."""
     aligned_path = Path(aligned_dir)
     output_path = Path(output_dir)
     visualizer = AlignedVisualizer()
 
     if class_num:
-        class_dirs = [aligned_path / f"class{class_num}"]
+        group_dirs = [aligned_path / f"class{class_num}"]
+    elif group:
+        group_dirs = [aligned_path / group]
     else:
-        class_dirs = list(aligned_path.glob("class*"))
+        group_dirs = sorted(
+            d for d in aligned_path.iterdir()
+            if d.is_dir() and any(d.glob("case_*"))
+        )
 
-    for class_dir in class_dirs:
-        if not class_dir.exists():
+    for group_dir in group_dirs:
+        if not group_dir.exists():
             continue
 
-        case_dirs = list(class_dir.glob("case_*"))
-        for case_dir in tqdm(case_dirs, desc=f"Visualizing {class_dir.name}"):
-            visualizer.visualize_case(case_dir, output_path / class_dir.name)
+        case_dirs = sorted(group_dir.glob("case_*"))
+        for case_dir in tqdm(case_dirs, desc=f"Visualizing {group_dir.name}"):
+            visualizer.visualize_case(case_dir, output_path / group_dir.name)
 
 
 @cli.command()
@@ -101,6 +115,149 @@ def process(input_dir, output_dir, class_num, case_id):
 
         for case_dir in tqdm(case_dirs, desc=f"Processing {class_dir.name}"):
             process_single_case(case_dir, input_path, output_path, current_class)
+
+
+@cli.command("process-vendor")
+@click.option(
+    "--input-dir",
+    required=True,
+    type=click.Path(exists=True),
+    help="Directory containing vendor ZIP files",
+)
+@click.option(
+    "--output-dir",
+    required=True,
+    type=click.Path(),
+    help="Output directory for aligned data",
+)
+@click.option(
+    "--group-name",
+    default="sample",
+    help="Group directory name (default: sample)",
+)
+def process_vendor(input_dir, output_dir, group_name):
+    """Process vendor-bundled MRI ZIPs into inference-ready aligned format."""
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    zip_files = sorted(input_path.glob("*.zip"))
+    if not zip_files:
+        logger.error(f"No ZIP files found in {input_path}")
+        return
+
+    logger.info(f"Found {len(zip_files)} ZIP files in {input_path}")
+
+    resampler = VolumeResampler()
+    exporter = PNGExporter()
+    success_count = 0
+
+    for zip_path in zip_files:
+        case_name = case_name_from_zip(zip_path)
+        if _process_single_vendor_zip(
+            zip_path, case_name, output_path, group_name, resampler, exporter
+        ):
+            success_count += 1
+
+    logger.info(f"\nProcessed {success_count}/{len(zip_files)} ZIPs successfully")
+    logger.info(f"Output: {output_path}")
+
+    if success_count > 0:
+        logger.info("Generating metadata.json...")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "generate_training_metadata",
+            Path(__file__).resolve().parents[2] / "tools" / "generate_training_metadata.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.generate_metadata(
+            data_dir=output_path,
+            output_path=output_path / "metadata.json",
+        )
+
+
+def _process_single_vendor_zip(
+    zip_path: Path,
+    case_name: str,
+    output_root: Path,
+    group_name: str,
+    resampler: VolumeResampler,
+    exporter: PNGExporter,
+) -> bool:
+    """Process a single vendor ZIP into the aligned output structure."""
+    logger.info(f"\n{'='*60}")
+    logger.info(f"Processing: {zip_path.name} -> {case_name}")
+    logger.info(f"{'='*60}")
+
+    case_dir = output_root / group_name / case_name
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extract_dir = Path(tmpdir) / "extracted"
+        extract_zip(zip_path, extract_dir)
+
+        dicomdir_path = find_dicomdir(extract_dir)
+        if dicomdir_path is None:
+            logger.error(f"No DICOMDIR found in {zip_path.name}")
+            return False
+
+        series_list = get_series_info(dicomdir_path)
+        logger.info(f"Found {len(series_list)} series")
+
+        classified = classify_series(series_list)
+        if classified["t2"] is None:
+            logger.error(f"No T2 series found for {case_name}, skipping")
+            return False
+
+        # Load T2 reference volume
+        logger.info("Loading T2 reference volume...")
+        t2_volume = resampler.load_dicom_series_as_sitk(
+            Path(classified["t2"]["dicom_dir"])
+        )
+        t2_size = t2_volume.GetSize()  # (X, Y, Z)
+        num_slices = t2_size[2]
+        height, width = t2_size[1], t2_size[0]
+        logger.info(f"  T2 volume: {t2_size}, spacing={t2_volume.GetSpacing()}")
+
+        # Export T2
+        logger.info("Exporting T2 PNGs...")
+        exporter.export_volume_to_png(t2_volume, case_dir / "t2")
+
+        # Process ADC
+        if classified["adc"] is not None:
+            logger.info("Loading and resampling ADC...")
+            adc_volume = resampler.load_dicom_series_as_sitk(
+                Path(classified["adc"]["dicom_dir"])
+            )
+            logger.info(
+                f"  ADC volume: {adc_volume.GetSize()}, spacing={adc_volume.GetSpacing()}"
+            )
+            adc_resampled = resampler.resample_to_reference(adc_volume, t2_volume)
+            exporter.export_volume_to_png(adc_resampled, case_dir / "adc")
+        else:
+            logger.info("No ADC series found, skipping")
+
+        # Process Calc
+        if classified["calc"] is not None:
+            logger.info("Loading and resampling Calc...")
+            calc_volume = resampler.load_dicom_series_as_sitk(
+                Path(classified["calc"]["dicom_dir"])
+            )
+            logger.info(
+                f"  Calc volume: {calc_volume.GetSize()}, spacing={calc_volume.GetSpacing()}"
+            )
+            calc_resampled = resampler.resample_to_reference(calc_volume, t2_volume)
+            exporter.export_volume_to_png(calc_resampled, case_dir / "calc")
+        else:
+            logger.info("No Calc/Trace series found, skipping")
+
+        # Create zero masks
+        logger.info("Creating zero masks...")
+        exporter.create_zero_masks(num_slices, height, width, case_dir / "mask_prostate")
+        exporter.create_zero_masks(num_slices, height, width, case_dir / "mask_target1")
+
+    logger.info(f"Done: {case_name} ({num_slices} slices, {width}x{height})")
+    return True
 
 
 def load_modality_volume(

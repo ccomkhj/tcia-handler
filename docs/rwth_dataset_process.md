@@ -21,7 +21,7 @@ Calc/Trace is only available from Siemens scanners. The inference pipeline handl
 ## Usage
 
 ```bash
-uv run python tools/process_vendor_samples.py \
+uv run dicom-mapper process-vendor \
   --input-dir test_sample \
   --output-dir data/aligned_v2_sample
 ```
@@ -30,8 +30,9 @@ uv run python tools/process_vendor_samples.py \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--input-dir` | `test_sample` | Directory containing vendor ZIP files |
-| `--output-dir` | `data/aligned_v2_sample` | Output directory for aligned data |
+| `--input-dir` | (required) | Directory containing vendor ZIP files |
+| `--output-dir` | (required) | Output directory for aligned data |
+| `--group-name` | `sample` | Group directory name under output-dir |
 
 ## What It Does
 
@@ -74,6 +75,27 @@ data/aligned_v2_sample/
         └── mask_target1/
 ```
 
+## Visualization
+
+Visualize the aligned output to verify spatial alignment across modalities:
+
+```bash
+uv run dicom-mapper visualize \
+  --aligned-dir data/aligned_v2_sample \
+  --output-dir data/visualizations_sample
+```
+
+This generates per-case PNG visualizations showing T2/ADC/Calc side-by-side with mask overlays (5 equally spaced slices per case). Output is saved to `data/visualizations_sample/sample/case_*/viz_*.png`.
+
+To visualize a specific group only:
+
+```bash
+uv run dicom-mapper visualize \
+  --aligned-dir data/aligned_v2_sample \
+  --output-dir data/visualizations_sample \
+  --group sample
+```
+
 ## Running Inference
 
 Point the MRI inference pipeline to the generated `metadata.json`:
@@ -91,7 +113,7 @@ The metadata is compatible with both `run_segmentation_inference()` and `run_cla
 
 To process additional vendor ZIPs, either:
 
-1. Add the ZIP filename to the `ZIP_TO_CASE` mapping in `tools/process_vendor_samples.py`
+1. Add the ZIP filename to the `ZIP_TO_CASE` mapping in `dicom_mapper/io/vendor.py`
 2. Or let the script auto-generate a case name from the filename
 
 The series classification is tag-based and should work for any Philips or Siemens MRI export that includes a DICOMDIR.

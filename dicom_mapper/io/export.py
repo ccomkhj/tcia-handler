@@ -1,5 +1,6 @@
 from pathlib import Path
 import numpy as np
+import SimpleITK as sitk
 from PIL import Image
 import pydicom
 from typing import Union
@@ -50,10 +51,59 @@ class PNGExporter:
     def export_mask_to_png(self, dcm_seg: pydicom.dataset.Dataset, output_dir: Path):
         """
         Export Segmentation frames to PNG.
-        
+
         Note: Standard DICOM SEG stores frames packed or one bit per pixel.
         pydicom's pixel_array handler should unpack this.
         If the SEG has multiple segments, they might be in different frames.
         This simplified exporter assumes 1 segment per file or unpacks all frames sequentially.
         """
         self.export_dicom_to_png(dcm_seg, output_dir)
+
+    def export_volume_to_png(self, volume: sitk.Image, output_dir: Path) -> int:
+        """
+        Export SimpleITK volume slices to a PNG sequence.
+
+        Each slice is normalized to uint8 (0-255) using per-slice min/max scaling.
+
+        Args:
+            volume: SimpleITK 3D image.
+            output_dir: Directory where PNGs will be saved.
+
+        Returns:
+            Number of slices exported.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        arr = sitk.GetArrayFromImage(volume)  # (Z, Y, X)
+        num_slices = arr.shape[0]
+
+        for i in range(num_slices):
+            frame = arr[i]
+            if frame.dtype != np.uint8:
+                min_val = float(frame.min())
+                max_val = float(frame.max())
+                if max_val > min_val:
+                    frame = ((frame - min_val) / (max_val - min_val) * 255.0).astype(
+                        np.uint8
+                    )
+                else:
+                    frame = np.zeros_like(frame, dtype=np.uint8)
+            Image.fromarray(frame).save(output_dir / f"{i:04d}.png")
+
+        return num_slices
+
+    def create_zero_masks(
+        self, num_slices: int, height: int, width: int, output_dir: Path
+    ):
+        """
+        Create all-zero mask PNGs for a given volume shape.
+
+        Args:
+            num_slices: Number of slices to create.
+            height: Image height in pixels.
+            width: Image width in pixels.
+            output_dir: Directory where PNGs will be saved.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        zero_img = Image.fromarray(np.zeros((height, width), dtype=np.uint8))
+        for i in range(num_slices):
+            zero_img.save(output_dir / f"{i:04d}.png")
