@@ -297,14 +297,17 @@ def generate_metadata(
     
     # Discover all cases
     case_dirs = []
-    for class_dir in sorted(data_dir.glob("class*")):
-        if not class_dir.is_dir():
+    for subdir in sorted(data_dir.iterdir()):
+        if not subdir.is_dir():
             continue
-        class_num = int(class_dir.name.replace("class", ""))
-        for case_dir in sorted(class_dir.glob("case_*")):
+        if subdir.name.startswith("class"):
+            class_num = int(subdir.name.replace("class", ""))
+        else:
+            class_num = 0  # Non-class directories (e.g. "sample") default to class 0
+        for case_dir in sorted(subdir.glob("case_*")):
             if not case_dir.is_dir():
                 continue
-            case_id = f"{class_dir.name}/{case_dir.name}"
+            case_id = f"{subdir.name}/{case_dir.name}"
             case_dirs.append((case_dir, case_id, class_num))
     
     logger.info(f"Found {len(case_dirs)} cases")
